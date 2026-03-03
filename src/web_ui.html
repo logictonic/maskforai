@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>maskforai</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#0d1117;--card:#161b22;--border:#30363d;--text:#c9d1d9;--text2:#8b949e;--accent:#58a6ff;--green:#3fb950;--red:#f85149;--orange:#d29922;--purple:#bc8cff}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;background:var(--bg);color:var(--text);font-size:14px}
+.container{max-width:1100px;margin:0 auto;padding:20px}
+header{display:flex;align-items:center;justify-content:space-between;padding:16px 0;border-bottom:1px solid var(--border);margin-bottom:24px}
+header h1{font-size:20px;font-weight:600}
+header h1 span{color:var(--accent)}
+.badge{display:inline-block;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:600}
+.badge-ok{background:#238636;color:#fff}
+.badge-dry{background:var(--orange);color:#000}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px;margin-bottom:24px}
+.stat{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:16px}
+.stat-label{font-size:11px;color:var(--text2);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px}
+.stat-value{font-size:28px;font-weight:600}
+.stat-value.green{color:var(--green)}
+.stat-value.red{color:var(--red)}
+.stat-value.blue{color:var(--accent)}
+.panel{background:var(--card);border:1px solid var(--border);border-radius:8px;margin-bottom:16px}
+.panel-header{padding:12px 16px;border-bottom:1px solid var(--border);font-weight:600;display:flex;align-items:center;justify-content:space-between}
+.panel-body{padding:16px}
+.tabs{display:flex;gap:0;border-bottom:1px solid var(--border);margin-bottom:16px}
+.tab{padding:8px 16px;cursor:pointer;border-bottom:2px solid transparent;color:var(--text2);font-size:13px}
+.tab.active{color:var(--accent);border-bottom-color:var(--accent)}
+.tab:hover{color:var(--text)}
+table{width:100%;border-collapse:collapse}
+th,td{text-align:left;padding:8px 12px;border-bottom:1px solid var(--border)}
+th{font-size:11px;color:var(--text2);text-transform:uppercase}
+td{font-size:13px}
+input,select,textarea{background:var(--bg);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:4px;font-size:13px;font-family:inherit}
+input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent)}
+textarea{width:100%;resize:vertical}
+.btn{padding:6px 14px;border-radius:4px;border:1px solid var(--border);background:var(--card);color:var(--text);cursor:pointer;font-size:13px}
+.btn:hover{background:var(--border)}
+.btn-primary{background:#238636;border-color:#238636;color:#fff}
+.btn-primary:hover{background:#2ea043}
+.btn-danger{background:transparent;border-color:var(--red);color:var(--red)}
+.btn-danger:hover{background:var(--red);color:#fff}
+.btn-sm{padding:3px 8px;font-size:12px}
+.form-row{display:flex;gap:8px;margin-bottom:8px;align-items:center;flex-wrap:wrap}
+.form-row label{min-width:100px;font-size:12px;color:var(--text2)}
+.form-row input,.form-row select{flex:1;min-width:120px}
+.toggle{position:relative;display:inline-block;width:36px;height:20px}
+.toggle input{opacity:0;width:0;height:0}
+.toggle .slider{position:absolute;top:0;left:0;right:0;bottom:0;background:var(--border);border-radius:20px;cursor:pointer;transition:.2s}
+.toggle input:checked+.slider{background:var(--green)}
+.toggle .slider:before{content:"";position:absolute;width:16px;height:16px;left:2px;top:2px;background:#fff;border-radius:50%;transition:.2s}
+.toggle input:checked+.slider:before{transform:translateX(16px)}
+#logs{background:#010409;border:1px solid var(--border);border-radius:4px;padding:8px;font-family:"JetBrains Mono",Consolas,monospace;font-size:12px;height:250px;overflow-y:auto;white-space:pre-wrap;word-break:break-all;color:var(--text2)}
+.log-entry{padding:1px 0}
+.log-mask{color:var(--orange)}
+.log-block{color:var(--red)}
+.log-info{color:var(--accent)}
+.test-area{display:flex;gap:12px}
+.test-area textarea{flex:1;min-height:80px}
+.test-result{flex:1;background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:8px;min-height:80px;font-family:monospace;font-size:12px;white-space:pre-wrap}
+.chip{display:inline-block;padding:1px 6px;border-radius:3px;font-size:11px;margin:1px}
+.chip-mask{background:#30363d;color:var(--orange)}
+.chip-block{background:#30363d;color:var(--red)}
+.chip-observe{background:#30363d;color:var(--purple)}
+.mt8{margin-top:8px}
+.mb8{margin-bottom:8px}
+.flex-end{display:flex;justify-content:flex-end;gap:8px}
+</style>
+</head>
+<body>
+<div class="container">
+<header>
+  <h1><span>mask</span>forai</h1>
+  <div>
+    <span id="statusBadge" class="badge badge-ok">running</span>
+    <span id="uptimeLabel" style="margin-left:8px;color:var(--text2);font-size:12px"></span>
+  </div>
+</header>
+
+<div class="grid" id="statsGrid">
+  <div class="stat"><div class="stat-label">Requests</div><div class="stat-value blue" id="sTotal">0</div></div>
+  <div class="stat"><div class="stat-label">Masked</div><div class="stat-value green" id="sMasked">0</div></div>
+  <div class="stat"><div class="stat-label">Blocked</div><div class="stat-value red" id="sBlocked">0</div></div>
+  <div class="stat"><div class="stat-label">Uptime</div><div class="stat-value" id="sUptime" style="font-size:18px">-</div></div>
+</div>
+
+<div class="tabs">
+  <div class="tab active" onclick="showTab('config')">Configuration</div>
+  <div class="tab" onclick="showTab('patterns')">Patterns</div>
+  <div class="tab" onclick="showTab('allowlist')">Allowlist</div>
+  <div class="tab" onclick="showTab('test')">Test</div>
+  <div class="tab" onclick="showTab('logs')">Live Logs</div>
+</div>
+
+<!-- Config Tab -->
+<div id="tab-config">
+<div class="panel">
+  <div class="panel-header">Runtime Configuration</div>
+  <div class="panel-body">
+    <div class="form-row"><label>Sensitivity</label>
+      <select id="cfgSensitivity"><option>low</option><option>medium</option><option>high</option><option>paranoid</option></select>
+    </div>
+    <div class="form-row"><label>Min Score</label><input id="cfgMinScore" type="number" step="0.05" min="0" max="1"></div>
+    <div class="form-row"><label>Whistledown</label><label class="toggle"><input id="cfgWhistledown" type="checkbox"><span class="slider"></span></label></div>
+    <div class="form-row"><label>Dry Run</label><label class="toggle"><input id="cfgDryRun" type="checkbox"><span class="slider"></span></label></div>
+    <div class="form-row"><label>Audit Log</label><label class="toggle"><input id="cfgAudit" type="checkbox"><span class="slider"></span></label></div>
+    <div class="form-row"><label>Filter Log</label>
+      <select id="cfgFilterLog"><option value="Off">Off</option><option value="Summary">Summary</option><option value="Detailed">Detailed</option></select>
+    </div>
+    <div class="form-row"><label>Upstream</label><input id="cfgUpstream" readonly style="color:var(--text2)"></div>
+    <div class="flex-end mt8">
+      <button class="btn btn-primary" onclick="saveConfig()">Save & Restart Required</button>
+    </div>
+  </div>
+</div>
+</div>
+
+<!-- Patterns Tab -->
+<div id="tab-patterns" style="display:none">
+<div class="panel">
+  <div class="panel-header">
+    Custom Patterns
+    <button class="btn btn-sm btn-primary" onclick="showAddPattern()">+ Add</button>
+  </div>
+  <div class="panel-body">
+    <div id="addPatternForm" style="display:none;margin-bottom:16px;padding:12px;background:var(--bg);border-radius:4px">
+      <div class="form-row"><label>Regex</label><input id="npPattern" placeholder="pattern regex"></div>
+      <div class="form-row"><label>Replacement</label><input id="npReplacement" value="[masked:custom]****"></div>
+      <div class="form-row"><label>Mask Type</label><input id="npType" value="custom"></div>
+      <div class="form-row"><label>Score</label><input id="npScore" type="number" step="0.1" value="0.8"></div>
+      <div class="form-row"><label>Action</label>
+        <select id="npAction"><option>mask</option><option>block</option><option>observe</option></select>
+      </div>
+      <div class="flex-end mt8">
+        <button class="btn" onclick="hideAddPattern()">Cancel</button>
+        <button class="btn btn-primary" onclick="addPattern()">Add Pattern</button>
+      </div>
+    </div>
+    <table>
+      <thead><tr><th>Pattern</th><th>Type</th><th>Score</th><th>Action</th><th></th></tr></thead>
+      <tbody id="patternsBody"></tbody>
+    </table>
+    <div id="patternsEmpty" style="text-align:center;padding:20px;color:var(--text2)">No custom patterns</div>
+  </div>
+</div>
+</div>
+
+<!-- Allowlist Tab -->
+<div id="tab-allowlist" style="display:none">
+<div class="panel">
+  <div class="panel-header">Allowlist</div>
+  <div class="panel-body">
+    <div class="form-row mb8">
+      <input id="newAllowItem" placeholder="Value to allowlist (e.g. admin@company.com)" style="flex:3">
+      <button class="btn btn-primary" onclick="addAllowItem()">Add</button>
+    </div>
+    <table>
+      <thead><tr><th>Value</th><th></th></tr></thead>
+      <tbody id="allowBody"></tbody>
+    </table>
+    <div id="allowEmpty" style="text-align:center;padding:20px;color:var(--text2)">No allowlist entries</div>
+  </div>
+</div>
+</div>
+
+<!-- Test Tab -->
+<div id="tab-test" style="display:none">
+<div class="panel">
+  <div class="panel-header">Test Masking</div>
+  <div class="panel-body">
+    <div class="test-area">
+      <div style="flex:1">
+        <div style="font-size:12px;color:var(--text2);margin-bottom:4px">Input Text</div>
+        <textarea id="testInput" placeholder="Enter text to test masking...&#10;e.g. Contact user@example.com or call +79161234567">Contact user@example.com, key: sk-ant-api03-test1234567890</textarea>
+      </div>
+      <div style="flex:1">
+        <div style="font-size:12px;color:var(--text2);margin-bottom:4px">Masked Output</div>
+        <div class="test-result" id="testOutput">Click "Test" to see results</div>
+      </div>
+    </div>
+    <div id="testDetections" class="mt8" style="font-size:12px"></div>
+    <div class="flex-end mt8"><button class="btn btn-primary" onclick="runTest()">Test</button></div>
+  </div>
+</div>
+</div>
+
+<!-- Logs Tab -->
+<div id="tab-logs" style="display:none">
+<div class="panel">
+  <div class="panel-header">
+    Live Logs (WebSocket)
+    <div>
+      <button class="btn btn-sm" onclick="clearLogs()">Clear</button>
+      <button class="btn btn-sm" id="wsBtn" onclick="toggleWs()">Connect</button>
+    </div>
+  </div>
+  <div class="panel-body"><div id="logs"></div></div>
+</div>
+</div>
+
+<!-- Mask Type Distribution -->
+<div class="panel">
+  <div class="panel-header">Mask Type Distribution</div>
+  <div class="panel-body">
+    <div id="maskTypes" style="display:flex;gap:6px;flex-wrap:wrap"></div>
+    <div id="maskTypesEmpty" style="text-align:center;padding:12px;color:var(--text2)">No masks applied yet</div>
+  </div>
+</div>
+</div>
+
+<script>
+const API=window.location.origin;
+let ws=null;
+
+function showTab(name){
+  document.querySelectorAll('[id^="tab-"]').forEach(el=>el.style.display='none');
+  document.getElementById('tab-'+name).style.display='block';
+  document.querySelectorAll('.tab').forEach(el=>el.classList.remove('active'));
+  event.target.classList.add('active');
+  if(name==='patterns')loadPatterns();
+  if(name==='allowlist')loadAllowlist();
+  if(name==='logs'&&!ws)toggleWs();
+}
+
+async function api(path,opts){
+  const r=await fetch(API+path,{headers:{'Content-Type':'application/json'},...opts});
+  return r.json();
+}
+
+async function loadStatus(){
+  try{
+    const s=await api('/api/status');
+    document.getElementById('statusBadge').textContent=s.status;
+    document.getElementById('uptimeLabel').textContent='v'+s.version;
+  }catch(e){
+    document.getElementById('statusBadge').textContent='offline';
+    document.getElementById('statusBadge').className='badge badge-dry';
+  }
+}
+
+async function loadStats(){
+  try{
+    const s=await api('/api/stats');
+    document.getElementById('sTotal').textContent=s.requests_total;
+    document.getElementById('sMasked').textContent=s.requests_masked;
+    document.getElementById('sBlocked').textContent=s.requests_blocked;
+    const h=Math.floor(s.uptime_secs/3600);
+    const m=Math.floor((s.uptime_secs%3600)/60);
+    document.getElementById('sUptime').textContent=h+'h '+m+'m';
+    const mt=document.getElementById('maskTypes');
+    const mte=document.getElementById('maskTypesEmpty');
+    const entries=Object.entries(s.masks_by_type||{}).sort((a,b)=>b[1]-a[1]);
+    if(entries.length){
+      mte.style.display='none';
+      mt.innerHTML=entries.map(([k,v])=>`<span class="chip chip-mask">${k}: ${v}</span>`).join('');
+    }else{
+      mte.style.display='block';mt.innerHTML='';
+    }
+  }catch(e){}
+}
+
+async function loadConfig(){
+  try{
+    const c=await api('/api/config');
+    document.getElementById('cfgSensitivity').value=c.sensitivity;
+    document.getElementById('cfgMinScore').value=c.min_score;
+    document.getElementById('cfgWhistledown').checked=c.whistledown;
+    document.getElementById('cfgDryRun').checked=c.dry_run;
+    document.getElementById('cfgAudit').checked=c.audit_log;
+    document.getElementById('cfgFilterLog').value=c.filter_log;
+    document.getElementById('cfgUpstream').value=c.upstream_url;
+  }catch(e){}
+}
+
+async function saveConfig(){
+  const data={
+    sensitivity:document.getElementById('cfgSensitivity').value,
+    min_score:parseFloat(document.getElementById('cfgMinScore').value),
+    whistledown:document.getElementById('cfgWhistledown').checked,
+    dry_run:document.getElementById('cfgDryRun').checked,
+    audit_log:document.getElementById('cfgAudit').checked,
+    filter_log:document.getElementById('cfgFilterLog').value
+  };
+  const r=await api('/api/config',{method:'POST',body:JSON.stringify(data)});
+  alert(r.note||'Saved');
+}
+
+async function loadPatterns(){
+  const r=await api('/api/patterns');
+  const body=document.getElementById('patternsBody');
+  const empty=document.getElementById('patternsEmpty');
+  if(!r.patterns||!r.patterns.length){body.innerHTML='';empty.style.display='block';return;}
+  empty.style.display='none';
+  body.innerHTML=r.patterns.map((p,i)=>`<tr>
+    <td style="font-family:monospace;font-size:12px;max-width:300px;overflow:hidden;text-overflow:ellipsis">${esc(p.pattern)}</td>
+    <td>${esc(p.mask_type)}</td>
+    <td>${p.score}</td>
+    <td><span class="chip chip-${p.action.toLowerCase()}">${p.action}</span></td>
+    <td><button class="btn btn-sm btn-danger" onclick="deletePattern(${i})">Del</button></td>
+  </tr>`).join('');
+}
+
+function showAddPattern(){document.getElementById('addPatternForm').style.display='block';}
+function hideAddPattern(){document.getElementById('addPatternForm').style.display='none';}
+
+async function addPattern(){
+  const data={
+    pattern:document.getElementById('npPattern').value,
+    replacement:document.getElementById('npReplacement').value,
+    mask_type:document.getElementById('npType').value,
+    score:parseFloat(document.getElementById('npScore').value),
+    action:document.getElementById('npAction').value
+  };
+  await api('/api/patterns',{method:'POST',body:JSON.stringify(data)});
+  hideAddPattern();loadPatterns();
+}
+
+async function deletePattern(i){
+  if(!confirm('Delete pattern #'+i+'?'))return;
+  await fetch(API+'/api/patterns/'+i,{method:'DELETE'});
+  loadPatterns();
+}
+
+async function loadAllowlist(){
+  const r=await api('/api/allowlist');
+  const body=document.getElementById('allowBody');
+  const empty=document.getElementById('allowEmpty');
+  if(!r.items||!r.items.length){body.innerHTML='';empty.style.display='block';return;}
+  empty.style.display='none';
+  body.innerHTML=r.items.map(v=>`<tr>
+    <td style="font-family:monospace">${esc(v)}</td>
+    <td><button class="btn btn-sm btn-danger" onclick="deleteAllow('${esc(v)}')">Del</button></td>
+  </tr>`).join('');
+}
+
+async function addAllowItem(){
+  const v=document.getElementById('newAllowItem').value.trim();
+  if(!v)return;
+  await api('/api/allowlist',{method:'POST',body:JSON.stringify({value:v})});
+  document.getElementById('newAllowItem').value='';
+  loadAllowlist();
+}
+
+async function deleteAllow(v){
+  await fetch(API+'/api/allowlist/'+encodeURIComponent(v),{method:'DELETE'});
+  loadAllowlist();
+}
+
+async function runTest(){
+  const text=document.getElementById('testInput').value;
+  if(!text)return;
+  const r=await api('/api/test',{method:'POST',body:JSON.stringify({text})});
+  document.getElementById('testOutput').textContent=r.masked;
+  const det=document.getElementById('testDetections');
+  if(r.detections&&r.detections.length){
+    det.innerHTML='<strong>Detections:</strong> '+r.detections.map(d=>`<span class="chip chip-mask">${esc(d)}</span>`).join(' ');
+  }else{
+    det.innerHTML='<span style="color:var(--text2)">No sensitive data detected</span>';
+  }
+}
+
+function toggleWs(){
+  const btn=document.getElementById('wsBtn');
+  if(ws){ws.close();ws=null;btn.textContent='Connect';return;}
+  const proto=location.protocol==='https:'?'wss:':'ws:';
+  ws=new WebSocket(proto+'//'+location.host+'/ws/logs');
+  ws.onopen=()=>{btn.textContent='Disconnect';addLog('[connected]','info');};
+  ws.onclose=()=>{btn.textContent='Connect';ws=null;addLog('[disconnected]','info');};
+  ws.onmessage=(e)=>addLog(e.data,'mask');
+}
+
+function addLog(msg,cls){
+  const el=document.getElementById('logs');
+  const d=document.createElement('div');
+  d.className='log-entry log-'+cls;
+  const ts=new Date().toLocaleTimeString();
+  d.textContent=ts+' '+msg;
+  el.appendChild(d);
+  el.scrollTop=el.scrollHeight;
+  if(el.children.length>500)el.removeChild(el.firstChild);
+}
+
+function clearLogs(){document.getElementById('logs').innerHTML='';}
+function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML;}
+
+// Init
+loadStatus();loadConfig();loadStats();
+setInterval(loadStats,5000);
+</script>
+</body>
+</html>

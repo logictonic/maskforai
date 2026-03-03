@@ -145,6 +145,7 @@ const PATTERN_DEFS: &[PatternDef] = &[
     PatternDef { pattern: r"r8_[a-zA-Z0-9]{20}", replacement: "[masked:api_key]****", mask_type: "api_key", score: 0.90, validator: None, context_words: &["replicate"], action: Action::Mask, sensitivity: Sensitivity::Low },
     PatternDef { pattern: r"AIza[0-9A-Za-z\-_]{35,}", replacement: "[masked:api_key]****", mask_type: "api_key", score: 0.90, validator: None, context_words: &["google", "firebase", "gcp"], action: Action::Mask, sensitivity: Sensitivity::Low },
     PatternDef { pattern: r"GOCSPX-[A-Za-z0-9_\-]{20,}", replacement: "[masked:api_key]****", mask_type: "api_key", score: 0.95, validator: None, context_words: &[], action: Action::Mask, sensitivity: Sensitivity::Low },
+    PatternDef { pattern: r"cr_[0-9a-f]{40,}", replacement: "[masked:api_key]****", mask_type: "api_key", score: 0.95, validator: None, context_words: &[], action: Action::Mask, sensitivity: Sensitivity::Low },
 
     // ═══════════════════════════════════════════════════════════════════
     // ── Cloud provider credentials ────────────────────────────────────
@@ -712,6 +713,13 @@ mod tests {
         let s = "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";
         let masked = mask_text_no_block(s);
         assert!(masked.contains("[masked:api_key]"), "Google OAuth secret not masked: {}", masked);
+    }
+
+    #[test]
+    fn masks_openai_proxy_key() {
+        let s = "cr_8ce490ef0ff3fb37cbc288500bb3303eb5a93cb491ae7e9c30eaf40b38613289";
+        let masked = mask_text_no_block(s);
+        assert!(masked.contains("[masked:api_key]"), "OpenAI proxy key not masked: {}", masked);
     }
 
     #[test]

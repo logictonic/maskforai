@@ -2,7 +2,7 @@
 //! Supports whistledown (reversible masking), dry-run, and SSE streaming modes.
 //! Part of MaskForAI.
 
-use crate::config::{Config, FilterLogLevel};
+use crate::config::{Config, FilterLogLevel, ProviderType};
 use crate::filter_log::FilterLogger;
 use crate::mask;
 use crate::patterns::MaskResult;
@@ -95,14 +95,21 @@ pub async fn proxy_handler(
 ) -> Response {
     let path = req.uri().path().to_string();
     let method = req.method().as_str();
-    let request_label = format!("{} {}", method, path);
+    let provider_tag = format!("[{}]", state.config.provider_name);
+    let request_label = format!("{} {} {}", provider_tag, method, path);
     let content_type = req
         .headers()
         .get("content-type")
         .cloned()
         .unwrap_or_else(|| axum::http::HeaderValue::from_static("application/json"));
 
-    info!(%method, %path, "Proxying request");
+    info!(
+        provider = %state.config.provider_name,
+        provider_type = %state.config.provider_type.as_str(),
+        %method,
+        %path,
+        "Proxying request"
+    );
 
     if let Some(web_state) = &state.web_state {
         web_state.send_log(&format!("[request] {}", request_label));
@@ -130,17 +137,21 @@ pub async fn proxy_handler(
         }
     };
 
-    let is_messages = path == "/v1/messages" || path.ends_with("/v1/messages")
+    let is_claude_messages = path == "/v1/messages"
+        || path.ends_with("/v1/messages")
         || path == "/v1/messages/count_tokens"
-        || path.ends_with("/v1/messages/count_tokens")
-        // OpenAI-compatible endpoints
-        || path == "/v1/chat/completions"
-        || path.ends_with("/v1/chat/completions");
-
+        || path.ends_with("/v1/messages/count_tokens");
+    let is_openai_chat = path == "/v1/chat/completions" || path.ends_with("/v1/chat/completions");
     let is_responses = path == "/responses"
         || path.ends_with("/responses")
         || path == "/v1/responses"
         || path.ends_with("/v1/responses");
+
+    let is_messages = match state.config.provider_type {
+        ProviderType::Claude => is_claude_messages,
+        ProviderType::Openai => is_openai_chat,
+        ProviderType::Compatible => is_claude_messages || is_openai_chat,
+    };
 
     let is_masked_path = is_messages || is_responses;
 
@@ -167,7 +178,13 @@ pub async fn proxy_handler(
             let whistledown_enabled = state.config.whistledown;
 
             // Whistledown mode: reversible masking (Messages API structure only)
-            let wmap = if whistledown_enabled && !dry_run && is_messages {
+            let wmap = if whistledown_enabled
+                && !dry_run
+                && is_messages
+                && matches!(
+                    state.config.provider_type,
+                    ProviderType::Claude | ProviderType::Compatible
+                ) {
                 let mut map = WhistledownMap::new();
                 map.apply(&mut json);
                 if map.has_mappings() {
@@ -231,7 +248,12 @@ pub async fn proxy_handler(
                         "Request BLOCKED: sensitive content detected"
                     );
                     if let Some(web_state) = &state.web_state {
-                        web_state.record_request(request_masked, true, &mask_types);
+                        web_state.record_request(
+                            &state.config.provider_name,
+                            request_masked,
+                            true,
+                            &mask_types,
+                        );
                         web_state.send_log(&format!(
                             "[blocked] {} :: {} detected",
                             request_label, mask_type
@@ -246,7 +268,12 @@ pub async fn proxy_handler(
             }
 
             if let Some(web_state) = &state.web_state {
-                web_state.record_request(request_masked, false, &mask_types);
+                web_state.record_request(
+                    &state.config.provider_name,
+                    request_masked,
+                    false,
+                    &mask_types,
+                );
             }
 
             if dry_run {
@@ -264,13 +291,13 @@ pub async fn proxy_handler(
             }
         } else {
             if let Some(web_state) = &state.web_state {
-                web_state.record_request(false, false, &[]);
+                web_state.record_request(&state.config.provider_name, false, false, &[]);
             }
             (body, None)
         }
     } else {
         if let Some(web_state) = &state.web_state {
-            web_state.record_request(false, false, &[]);
+            web_state.record_request(&state.config.provider_name, false, false, &[]);
         }
         (body, None)
     };

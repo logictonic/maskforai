@@ -365,6 +365,8 @@ const DEFAULT_ALLOWLIST: &[&str] = &[
     "255.255.255.255",
     "255.255.255.0",
     "0.0.0.1",
+    "localhost",
+    "192.168.1.1",
 ];
 
 /// Check if a matched value is in the allow-list.

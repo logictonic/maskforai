@@ -1,18 +1,16 @@
 //! Configuration for maskforai.
 
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Filter logging verbosity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FilterLogLevel {
-    /// No filter logging.
     #[default]
     Off,
-    /// Log summary per request: "filter: api_key=2, email=1".
     Summary,
-    /// Log each mask type with context (path/field).
     Detailed,
 }
 
@@ -33,7 +31,6 @@ impl FilterLogLevel {
     }
 }
 
-/// Custom pattern definition loaded from config file.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct CustomPatternDef {
     pub pattern: String,
@@ -58,7 +55,6 @@ pub enum CustomAction {
     Observe,
 }
 
-/// Custom patterns config file structure.
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 pub struct PatternsConfig {
     #[serde(default)]
@@ -68,7 +64,6 @@ pub struct PatternsConfig {
 }
 
 impl PatternsConfig {
-    /// Load custom patterns from config file if it exists.
     pub fn load() -> Self {
         let path = Self::config_path();
         if !path.exists() {
@@ -81,12 +76,20 @@ impl PatternsConfig {
                     config
                 }
                 Err(e) => {
-                    tracing::warn!(path = %path.display(), error = %e, "Failed to parse custom patterns config");
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "Failed to parse custom patterns config"
+                    );
                     Self::default()
                 }
             },
             Err(e) => {
-                tracing::warn!(path = %path.display(), error = %e, "Failed to read custom patterns config");
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "Failed to read custom patterns config"
+                );
                 Self::default()
             }
         }
@@ -96,105 +99,201 @@ impl PatternsConfig {
         if let Ok(p) = env::var("MASKFORAI_PATTERNS_FILE") {
             return PathBuf::from(p);
         }
-        let config_dir = dirs_config_dir().join("maskforai");
-        config_dir.join("patterns.toml")
+        dirs_config_dir().join("maskforai").join("patterns.toml")
     }
 
-    /// Config path as String (for web UI).
     pub fn config_path_string() -> String {
         Self::config_path().to_string_lossy().to_string()
     }
 }
 
-/// Get the user config directory.
-fn dirs_config_dir() -> PathBuf {
-    env::var("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-            PathBuf::from(home).join(".config")
-        })
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProviderType {
+    Claude,
+    Openai,
+    Compatible,
 }
 
-/// Proxy configuration.
+impl ProviderType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Openai => "openai",
+            Self::Compatible => "compatible",
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ProviderDefinition {
+    #[serde(rename = "type")]
+    pub provider_type: ProviderType,
+    #[serde(default)]
+    pub bind: Option<String>,
+    pub port: u16,
+    pub upstream_url: String,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct ProvidersFile {
+    #[serde(default)]
+    providers: BTreeMap<String, ProviderDefinition>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// Port to listen on.
+    pub provider_name: String,
+    pub provider_type: ProviderType,
     pub port: u16,
-    /// Upstream Anthropic API base URL (e.g. relay or api.anthropic.com).
     pub upstream_url: String,
-    /// Bind address.
     pub bind: String,
-    /// Filter logging level.
     pub filter_log: FilterLogLevel,
-    /// Minimum confidence score for masking (0.0–1.0).
     pub min_score: f32,
-    /// Allow-list of values that should never be masked.
     pub allowlist: Vec<String>,
-    /// Enable audit logging with SHA256 hashes.
     pub audit_log: bool,
-    /// Custom patterns loaded from config file.
     pub custom_patterns: PatternsConfig,
-    /// Enable whistledown reversible masking mode.
     pub whistledown: bool,
-    /// Sensitivity level (low, medium, high, paranoid).
     pub sensitivity: String,
-    /// Dry-run mode: log detections but don't modify traffic.
     pub dry_run: bool,
-    /// Web UI port (0 = disabled).
     pub web_port: u16,
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeConfig {
+    pub providers: Vec<Config>,
+    pub filter_log: FilterLogLevel,
+    pub min_score: f32,
+    pub allowlist: Vec<String>,
+    pub audit_log: bool,
+    pub custom_patterns: PatternsConfig,
+    pub whistledown: bool,
+    pub sensitivity: String,
+    pub dry_run: bool,
+    pub web_port: u16,
+    pub providers_path: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProviderInfo {
+    pub name: String,
+    pub provider_type: String,
+    pub bind: String,
+    pub port: u16,
+    pub upstream_url: String,
+    pub legacy: bool,
+}
+
+impl RuntimeConfig {
+    pub fn from_env() -> Result<Self, String> {
+        let defaults = GlobalConfig::from_env();
+        let providers_path = providers_config_path();
+        let definitions = load_provider_definitions(&providers_path)?;
+        let providers = if definitions.is_empty() {
+            vec![defaults.to_legacy_provider()]
+        } else {
+            let mut configs = Vec::with_capacity(definitions.len());
+            for (name, def) in definitions {
+                configs.push(defaults.to_provider_config(&name, def));
+            }
+            configs
+        };
+        validate_providers(&providers, defaults.web_port)?;
+
+        Ok(Self {
+            providers,
+            filter_log: defaults.filter_log,
+            min_score: defaults.min_score,
+            allowlist: defaults.allowlist,
+            audit_log: defaults.audit_log,
+            custom_patterns: defaults.custom_patterns,
+            whistledown: defaults.whistledown,
+            sensitivity: defaults.sensitivity,
+            dry_run: defaults.dry_run,
+            web_port: defaults.web_port,
+            providers_path: providers_path.to_string_lossy().to_string(),
+        })
+    }
+
+    pub fn provider_infos(&self) -> Vec<ProviderInfo> {
+        self.providers
+            .iter()
+            .map(|cfg| ProviderInfo {
+                name: cfg.provider_name.clone(),
+                provider_type: cfg.provider_type.as_str().to_string(),
+                bind: cfg.bind.clone(),
+                port: cfg.port,
+                upstream_url: cfg.upstream_url.clone(),
+                legacy: cfg.provider_type == ProviderType::Compatible,
+            })
+            .collect()
+    }
 }
 
 impl Config {
     pub fn from_env() -> Self {
+        RuntimeConfig::from_env()
+            .expect("Invalid runtime configuration")
+            .providers
+            .into_iter()
+            .next()
+            .expect("At least one provider must be configured")
+    }
+}
+
+#[derive(Debug, Clone)]
+struct GlobalConfig {
+    port: u16,
+    upstream_url: String,
+    bind: String,
+    filter_log: FilterLogLevel,
+    min_score: f32,
+    allowlist: Vec<String>,
+    audit_log: bool,
+    custom_patterns: PatternsConfig,
+    whistledown: bool,
+    sensitivity: String,
+    dry_run: bool,
+    web_port: u16,
+}
+
+impl GlobalConfig {
+    fn from_env() -> Self {
         let port = env::var("MASKFORAI_PORT")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(8432);
-
         let upstream_url = env::var("MASKFORAI_UPSTREAM")
             .or_else(|_| env::var("ANTHROPIC_BASE_URL"))
             .unwrap_or_else(|_| "https://api.anthropic.com".to_string());
-
         let bind = env::var("MASKFORAI_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
-
         let filter_log = FilterLogLevel::from_env();
-
         let min_score: f32 = env::var("MASKFORAI_MIN_SCORE")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0.0);
-
         let allowlist: Vec<String> = env::var("MASKFORAI_ALLOWLIST")
             .unwrap_or_default()
             .split(',')
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
-
         let audit_log = env::var("MASKFORAI_AUDIT_LOG")
             .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
             .unwrap_or(false);
-
         let whistledown = env::var("MASKFORAI_WHISTLEDOWN")
             .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
             .unwrap_or(true);
-
-        let sensitivity = env::var("MASKFORAI_SENSITIVITY")
-            .unwrap_or_else(|_| "medium".to_string());
-
+        let sensitivity =
+            env::var("MASKFORAI_SENSITIVITY").unwrap_or_else(|_| "medium".to_string());
         let dry_run = env::var("MASKFORAI_DRY_RUN")
             .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
             .unwrap_or(false);
-
         let web_port: u16 = env::var("MASKFORAI_WEB_PORT")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(8433);
-
         let custom_patterns = PatternsConfig::load();
-
-        // Merge custom allowlist with env allowlist
         let mut all_allowlist = allowlist;
         all_allowlist.extend(custom_patterns.allowlist.clone());
 
@@ -212,5 +311,168 @@ impl Config {
             dry_run,
             web_port,
         }
+    }
+
+    fn to_legacy_provider(&self) -> Config {
+        self.build_provider_config(
+            "default",
+            ProviderType::Compatible,
+            self.bind.clone(),
+            self.port,
+            self.upstream_url.clone(),
+        )
+    }
+
+    fn to_provider_config(&self, name: &str, def: ProviderDefinition) -> Config {
+        self.build_provider_config(
+            name,
+            def.provider_type,
+            def.bind.unwrap_or_else(|| self.bind.clone()),
+            def.port,
+            def.upstream_url.trim_end_matches('/').to_string(),
+        )
+    }
+
+    fn build_provider_config(
+        &self,
+        name: &str,
+        provider_type: ProviderType,
+        bind: String,
+        port: u16,
+        upstream_url: String,
+    ) -> Config {
+        Config {
+            provider_name: name.to_string(),
+            provider_type,
+            port,
+            upstream_url,
+            bind,
+            filter_log: self.filter_log,
+            min_score: self.min_score,
+            allowlist: self.allowlist.clone(),
+            audit_log: self.audit_log,
+            custom_patterns: self.custom_patterns.clone(),
+            whistledown: self.whistledown,
+            sensitivity: self.sensitivity.clone(),
+            dry_run: self.dry_run,
+            web_port: self.web_port,
+        }
+    }
+}
+
+fn load_provider_definitions(path: &Path) -> Result<BTreeMap<String, ProviderDefinition>, String> {
+    if !path.exists() {
+        return Ok(BTreeMap::new());
+    }
+    let content = fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let providers: ProvidersFile = toml::from_str(&content).map_err(|e| e.to_string())?;
+    Ok(providers.providers)
+}
+
+fn validate_providers(providers: &[Config], web_port: u16) -> Result<(), String> {
+    let mut used = BTreeMap::new();
+    for cfg in providers {
+        let addr = format!("{}:{}", cfg.bind, cfg.port);
+        if let Some(existing) = used.insert(addr.clone(), cfg.provider_name.clone()) {
+            return Err(format!(
+                "Provider port conflict: {} and {} both use {}",
+                existing, cfg.provider_name, addr
+            ));
+        }
+        if web_port > 0 && cfg.port == web_port {
+            return Err(format!(
+                "Provider {} uses the same port as Web UI: {}",
+                cfg.provider_name, web_port
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn providers_config_path() -> PathBuf {
+    if let Ok(p) = env::var("MASKFORAI_PROVIDERS_FILE") {
+        return PathBuf::from(p);
+    }
+    dirs_config_dir().join("maskforai").join("providers.toml")
+}
+
+pub fn providers_config_path_string() -> String {
+    providers_config_path().to_string_lossy().to_string()
+}
+
+fn dirs_config_dir() -> PathBuf {
+    env::var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+            PathBuf::from(home).join(".config")
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_multi_provider_toml() {
+        let content = r#"
+[providers.claude]
+type = "claude"
+port = 8432
+upstream_url = "https://api.anthropic.com"
+
+[providers.openai]
+type = "openai"
+port = 8434
+upstream_url = "https://api.openai.com/v1"
+"#;
+
+        let parsed: ProvidersFile = toml::from_str(content).unwrap();
+        assert_eq!(parsed.providers.len(), 2);
+        assert_eq!(
+            parsed.providers.get("claude").unwrap().provider_type,
+            ProviderType::Claude
+        );
+        assert_eq!(parsed.providers.get("openai").unwrap().port, 8434);
+    }
+
+    #[test]
+    fn detects_port_conflicts() {
+        let providers = vec![
+            Config {
+                provider_name: "claude".into(),
+                provider_type: ProviderType::Claude,
+                port: 8432,
+                upstream_url: "https://api.anthropic.com".into(),
+                bind: "127.0.0.1".into(),
+                filter_log: FilterLogLevel::Off,
+                min_score: 0.0,
+                allowlist: Vec::new(),
+                audit_log: false,
+                custom_patterns: PatternsConfig::default(),
+                whistledown: true,
+                sensitivity: "medium".into(),
+                dry_run: false,
+                web_port: 8433,
+            },
+            Config {
+                provider_name: "openai".into(),
+                provider_type: ProviderType::Openai,
+                port: 8432,
+                upstream_url: "https://api.openai.com/v1".into(),
+                bind: "127.0.0.1".into(),
+                filter_log: FilterLogLevel::Off,
+                min_score: 0.0,
+                allowlist: Vec::new(),
+                audit_log: false,
+                custom_patterns: PatternsConfig::default(),
+                whistledown: true,
+                sensitivity: "medium".into(),
+                dry_run: false,
+                web_port: 8433,
+            },
+        ];
+
+        assert!(validate_providers(&providers, 8433).is_err());
     }
 }

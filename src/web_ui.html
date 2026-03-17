@@ -64,6 +64,7 @@ textarea{width:100%;resize:vertical}
 .chip-mask{background:#30363d;color:var(--orange)}
 .chip-block{background:#30363d;color:var(--red)}
 .chip-observe{background:#30363d;color:var(--purple)}
+.mono{font-family:"JetBrains Mono",Consolas,monospace}
 .mt8{margin-top:8px}
 .mb8{margin-bottom:8px}
 .flex-end{display:flex;justify-content:flex-end;gap:8px}
@@ -84,6 +85,17 @@ textarea{width:100%;resize:vertical}
   <div class="stat"><div class="stat-label">Masked</div><div class="stat-value green" id="sMasked">0</div></div>
   <div class="stat"><div class="stat-label">Blocked</div><div class="stat-value red" id="sBlocked">0</div></div>
   <div class="stat"><div class="stat-label">Uptime</div><div class="stat-value" id="sUptime" style="font-size:18px">-</div></div>
+</div>
+
+<div class="panel">
+  <div class="panel-header">Provider Listeners</div>
+  <div class="panel-body">
+    <table>
+      <thead><tr><th>Name</th><th>Type</th><th>Bind</th><th>Port</th><th>Upstream</th><th>Requests</th><th>Masked</th><th>Blocked</th></tr></thead>
+      <tbody id="providersBody"></tbody>
+    </table>
+    <div id="providersEmpty" style="text-align:center;padding:20px;color:var(--text2)">No providers configured</div>
+  </div>
 </div>
 
 <div class="tabs">
@@ -109,7 +121,8 @@ textarea{width:100%;resize:vertical}
     <div class="form-row"><label>Filter Log</label>
       <select id="cfgFilterLog"><option value="Off">Off</option><option value="Summary">Summary</option><option value="Detailed">Detailed</option></select>
     </div>
-    <div class="form-row"><label>Upstream</label><input id="cfgUpstream" readonly style="color:var(--text2)"></div>
+    <div class="form-row"><label>Providers</label><input id="cfgProvidersCount" readonly style="color:var(--text2)"></div>
+    <div class="form-row"><label>Providers TOML</label><input id="cfgProvidersPath" readonly class="mono" style="color:var(--text2)"></div>
     <div class="flex-end mt8">
       <button class="btn btn-primary" onclick="saveConfig()">Save & Restart Required</button>
     </div>
@@ -213,6 +226,7 @@ textarea{width:100%;resize:vertical}
 <script>
 const API=window.location.origin;
 let ws=null;
+let providers=[];
 
 function showTab(name){
   document.querySelectorAll('[id^="tab-"]').forEach(el=>el.style.display='none');
@@ -233,7 +247,7 @@ async function loadStatus(){
   try{
     const s=await api('/api/status');
     document.getElementById('statusBadge').textContent=s.status;
-    document.getElementById('uptimeLabel').textContent='v'+s.version;
+    document.getElementById('uptimeLabel').textContent='v'+s.version+' · providers '+s.providers_count;
   }catch(e){
     document.getElementById('statusBadge').textContent='offline';
     document.getElementById('statusBadge').className='badge badge-dry';
@@ -258,6 +272,7 @@ async function loadStats(){
     }else{
       mte.style.display='block';mt.innerHTML='';
     }
+    renderProviders(s.by_provider||{});
   }catch(e){}
 }
 
@@ -270,8 +285,42 @@ async function loadConfig(){
     document.getElementById('cfgDryRun').checked=c.dry_run;
     document.getElementById('cfgAudit').checked=c.audit_log;
     document.getElementById('cfgFilterLog').value=c.filter_log;
-    document.getElementById('cfgUpstream').value=c.upstream_url;
+    document.getElementById('cfgProvidersCount').value=c.providers_count;
+    document.getElementById('cfgProvidersPath').value=c.providers_path;
   }catch(e){}
+}
+
+async function loadProviders(){
+  try{
+    const r=await api('/api/providers');
+    providers=r.providers||[];
+    document.getElementById('cfgProvidersPath').value=r.config_path||'';
+    renderProviders({});
+  }catch(e){}
+}
+
+function renderProviders(statsByProvider){
+  const body=document.getElementById('providersBody');
+  const empty=document.getElementById('providersEmpty');
+  if(!providers.length){
+    body.innerHTML='';
+    empty.style.display='block';
+    return;
+  }
+  empty.style.display='none';
+  body.innerHTML=providers.map(p=>{
+    const st=statsByProvider[p.name]||{};
+    return `<tr>
+      <td>${esc(p.name)}${p.legacy?' <span class="chip">legacy</span>':''}</td>
+      <td>${esc(p.provider_type)}</td>
+      <td class="mono">${esc(p.bind)}</td>
+      <td class="mono">${p.port}</td>
+      <td class="mono" style="max-width:360px;overflow:hidden;text-overflow:ellipsis">${esc(p.upstream_url)}</td>
+      <td>${st.requests_total||0}</td>
+      <td>${st.requests_masked||0}</td>
+      <td>${st.requests_blocked||0}</td>
+    </tr>`;
+  }).join('');
 }
 
 async function saveConfig(){
@@ -386,7 +435,7 @@ function clearLogs(){document.getElementById('logs').innerHTML='';}
 function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML;}
 
 // Init
-loadStatus();loadConfig();loadStats();
+loadStatus();loadConfig();loadProviders();loadStats();
 toggleWs();
 setInterval(loadStats,1000);
 </script>

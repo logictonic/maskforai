@@ -161,7 +161,7 @@ install_binary() {
     echo "==> Installed to $BIN_DIR/maskforai"
 }
 
-# Create config template
+# Create config templates
 install_config() {
     mkdir -p "$CONFIG_DIR"
     local conf="$CONFIG_DIR/env.conf"
@@ -175,14 +175,14 @@ install_config() {
             fi
         fi
         cat > "$conf" << EOF
-# MaskForAI configuration
-# Upstream relay URL (required)
+# MaskForAI global configuration
+# Legacy single-provider fallback upstream (used only when providers.toml is absent)
 MASKFORAI_UPSTREAM=$upstream
 
-# Port (default: 8432)
+# Legacy single-provider fallback port (default: 8432)
 # MASKFORAI_PORT=8432
 
-# Bind address (default: 127.0.0.1)
+# Legacy single-provider fallback bind (default: 127.0.0.1)
 # MASKFORAI_BIND=127.0.0.1
 
 # Filter logging: off, summary, detailed (default: off)
@@ -193,7 +193,8 @@ MASKFORAI_UPSTREAM=$upstream
 # MASKFORAI_MIN_SCORE=0.0
 
 # Allow-list: comma-separated values that should never be masked
-# MASKFORAI_ALLOWLIST=test@internal.corp,192.168.1.1
+# Built-in: example.com, test@example.com, localhost, 127.0.0.1, etc.
+MASKFORAI_ALLOWLIST=test@example.com,user@example.com,admin@example.com
 
 # Audit log: log SHA256 hashes of masked values (default: off)
 # MASKFORAI_AUDIT_LOG=false
@@ -203,9 +204,33 @@ MASKFORAI_UPSTREAM=$upstream
 MASKFORAI_WHISTLEDOWN=true
 EOF
         echo "==> Created config template: $conf"
-        echo "    Edit it to change MASKFORAI_UPSTREAM if needed"
+        echo "    Edit it to change global defaults if needed"
     else
         echo "==> Config exists: $conf"
+    fi
+
+    local providers="$CONFIG_DIR/providers.toml"
+    if [[ ! -f "$providers" ]]; then
+        cat > "$providers" << EOF
+# Multi-provider listener configuration for maskforai
+# One process can expose multiple local ports, one per provider.
+
+[providers.claude]
+type = "claude"
+bind = "127.0.0.1"
+port = 8432
+upstream_url = "$upstream"
+
+[providers.openai]
+type = "openai"
+bind = "127.0.0.1"
+port = 8434
+upstream_url = "https://api.openai.com"
+EOF
+        echo "==> Created providers template: $providers"
+        echo "    Edit each provider upstream_url to match your relay/provider base URL"
+    else
+        echo "==> Providers config exists: $providers"
     fi
 
     # Create patterns.toml template if missing
@@ -275,9 +300,9 @@ ensure_rust
 ensure_source
 build
 install_binary
+install_config
 
 if [[ "$NO_SYSTEMD" != true ]]; then
-    install_config
     install_systemd
     if [[ "$NO_START" != true ]]; then
         start_service
@@ -292,9 +317,10 @@ echo ""
 echo "==> Done!"
 echo ""
 echo "Next steps:"
-echo "  1. Edit $CONFIG_DIR/env.conf and set MASKFORAI_UPSTREAM to your relay URL"
-echo "  2. For Claude Code, set ANTHROPIC_BASE_URL=http://127.0.0.1:8432"
-echo "  3. Restart session or log out/in for env vars to apply"
+echo "  1. Edit $CONFIG_DIR/providers.toml and set each provider upstream_url"
+echo "  2. Adjust $CONFIG_DIR/env.conf for global masking defaults if needed"
+echo "  3. For Claude Code, set ANTHROPIC_BASE_URL=http://127.0.0.1:8432"
+echo "  4. For OpenAI-compatible clients, point them to http://127.0.0.1:8434"
 echo ""
 echo "Commands:"
 echo "  systemctl --user status maskforai   # Check status"

@@ -1,6 +1,6 @@
 # MaskForAI
 
-Local HTTP proxy that masks sensitive data (API keys, passwords, PII) in Claude Code / openclaw requests before forwarding to Anthropic API relay.
+Local HTTP proxy that masks sensitive data (API keys, passwords, PII) in Claude Code / OpenAI-compatible requests before forwarding to provider upstreams or relays.
 
 ## Install
 
@@ -18,18 +18,43 @@ The installer will:
 1. Detect distro and install build dependencies (gcc, curl) if needed
 2. Install Rust via rustup if `cargo` is not present
 3. Build from source and install to `~/.local/bin/maskforai`
-4. Create `~/.config/maskforai/env.conf` (template) and systemd user service
+4. Create `~/.config/maskforai/env.conf`, `providers.toml`, and systemd user service
 5. Enable and start the service
 
-**Post-install:** Edit `~/.config/maskforai/env.conf` and set `MASKFORAI_UPSTREAM` to your relay URL.
+**Post-install:** Edit `~/.config/maskforai/providers.toml` and set each provider `upstream_url`.
 
 ## Architecture
 
 ```
-[Claude Code / openclaw] --HTTP--> [MaskForAI localhost:8432] --HTTPS--> [Relay] --HTTPS--> [api.anthropic.com]
+[Claude client] --HTTP--> [MaskForAI :8432] --HTTPS--> [Claude relay/upstream]
+[OpenAI client] --HTTP--> [MaskForAI :8434] --HTTPS--> [OpenAI relay/upstream]
 ```
 
-The proxy intercepts Anthropic Messages API requests, applies regex-based masking to `system` and `messages[].content`, then forwards the sanitized payload to the upstream relay.
+One `maskforai` process can expose multiple local ports, one per provider. Each listener has its own upstream URL and provider behavior profile.
+
+## Provider config
+
+Provider listeners live in `~/.config/maskforai/providers.toml`:
+
+```toml
+[providers.claude]
+type = "claude"
+bind = "127.0.0.1"
+port = 8432
+upstream_url = "https://api.anthropic.com"
+
+[providers.openai]
+type = "openai"
+bind = "127.0.0.1"
+port = 8434
+upstream_url = "https://api.openai.com"
+```
+
+Supported provider types today:
+- `claude`
+- `openai`
+
+If `providers.toml` is missing, MaskForAI falls back to legacy single-provider mode using `MASKFORAI_PORT`, `MASKFORAI_BIND`, and `MASKFORAI_UPSTREAM`.
 
 ## Usage with Claude Code
 
@@ -40,19 +65,24 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:8432
 export ANTHROPIC_AUTH_TOKEN=<your-token>
 ```
 
-## Usage with openclaw
+## Usage with OpenAI-compatible clients
 
-Configure openclaw to use MaskForAI:
+Point the client to the OpenAI listener:
 
 ```bash
-export ANTHROPIC_BASE_URL=http://127.0.0.1:8432
-openclaw chat "your prompt here"
+export OPENAI_BASE_URL=http://127.0.0.1:8434
+export OPENAI_API_KEY=<your-token>
 ```
 
-Or set in openclaw config file (`~/.config/openclaw/config.toml`):
+Example provider config for Codex:
 
 ```toml
-base_url = "http://127.0.0.1:8432"
+[model_providers.maskforai_openai]
+name = "maskforai_openai"
+base_url = "http://127.0.0.1:8434"
+wire_api = "responses"
+requires_openai_auth = true
+env_key = "OPENAI_API_KEY"
 ```
 
 ## Build
@@ -62,15 +92,13 @@ cd maskforai
 cargo build --release
 ```
 
-## Configure upstream
+## Configure global defaults
 
-Set the relay URL (the real Anthropic API endpoint):
+`env.conf` now holds global masking defaults and legacy single-provider fallback:
 
 ```bash
 export MASKFORAI_UPSTREAM=https://api.anthropic.com
 ```
-
-Or use `ANTHROPIC_BASE_URL` if it points to your relay.
 
 ## Run the proxy
 
@@ -78,7 +106,10 @@ Or use `ANTHROPIC_BASE_URL` if it points to your relay.
 ./target/release/maskforai
 ```
 
-Defaults: listen on `127.0.0.1:8432`, upstream from `MASKFORAI_UPSTREAM` or `ANTHROPIC_BASE_URL`.
+Defaults:
+- Claude listener on `127.0.0.1:8432`
+- OpenAI listener on `127.0.0.1:8434`
+- Web UI on `127.0.0.1:8433`
 
 ## Web UI
 
@@ -86,6 +117,7 @@ MaskForAI includes a built-in web interface for configuration management, availa
 
 Features:
 - View real-time statistics (requests, masks, blocks)
+- View configured providers and per-provider counters
 - Edit configuration (sensitivity, whistledown, dry-run, etc.)
 - Manage custom regex patterns
 - Manage allowlist
@@ -98,9 +130,9 @@ Set `MASKFORAI_WEB_PORT=0` to disable the web UI.
 
 | Variable | Default | Description |
 |---------|---------|-------------|
-| `MASKFORAI_PORT` | 8432 | Listen port |
-| `MASKFORAI_BIND` | 127.0.0.1 | Bind address |
-| `MASKFORAI_UPSTREAM` | (from ANTHROPIC_BASE_URL) | Upstream API URL |
+| `MASKFORAI_PORT` | 8432 | Legacy single-provider listen port |
+| `MASKFORAI_BIND` | 127.0.0.1 | Legacy single-provider bind |
+| `MASKFORAI_UPSTREAM` | (from ANTHROPIC_BASE_URL) | Legacy single-provider upstream URL |
 | `MASKFORAI_LOG_FILTER` | off | Filter logging: `off`, `summary`, `detailed` |
 | `MASKFORAI_SENSITIVITY` | medium | Sensitivity: `low`, `medium`, `high`, `paranoid` |
 | `MASKFORAI_WHISTLEDOWN` | true | Reversible masking with numbered tokens |
@@ -131,6 +163,7 @@ Use `RUST_LOG=maskforai=info` (or `debug` for detailed) to see filter logs.
 - **Entropy detection**: Shannon entropy-based high-entropy secret detection
 - **Dry-run mode**: Log detections without modifying traffic
 - **Web UI**: Built-in dashboard for configuration and monitoring
+- **Multi-provider listeners**: One process can serve Claude and OpenAI-compatible traffic on different local ports
 - **Custom patterns**: Add your own regex patterns via TOML config
 
 Format: `[masked:type]****` so the AI knows data was redacted.

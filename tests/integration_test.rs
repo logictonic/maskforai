@@ -4,12 +4,14 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::Router;
 use httpmock::prelude::*;
-use maskforai::config::{Config, FilterLogLevel, PatternsConfig};
+use maskforai::config::{Config, FilterLogLevel, PatternsConfig, ProviderType};
 use maskforai::proxy::{proxy_handler, ProxyState};
 use tower::ServiceExt;
 
 fn test_config(upstream_url: String) -> Config {
     Config {
+        provider_name: "test".to_string(),
+        provider_type: ProviderType::Compatible,
         port: 8432,
         upstream_url,
         bind: "127.0.0.1".to_string(),

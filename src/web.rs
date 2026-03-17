@@ -7,15 +7,23 @@
 //! - Viewing filter logs
 //! - Live log streaming via WebSocket
 
-use axum::extract::{State, WebSocketUpgrade, ws};
+use axum::extract::{ws, State, WebSocketUpgrade};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{get, post, delete};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ProviderStats {
+    pub requests_total: u64,
+    pub requests_masked: u64,
+    pub requests_blocked: u64,
+    pub masks_by_type: HashMap<String, u64>,
+}
 
 /// Stats tracked by the proxy.
 #[derive(Debug, Clone, Default, Serialize)]
@@ -24,6 +32,7 @@ pub struct ProxyStats {
     pub requests_masked: u64,
     pub requests_blocked: u64,
     pub masks_by_type: HashMap<String, u64>,
+    pub by_provider: HashMap<String, ProviderStats>,
     pub uptime_secs: u64,
 }
 
@@ -32,23 +41,33 @@ pub struct ProxyStats {
 pub struct WebState {
     pub stats: Arc<Mutex<ProxyStats>>,
     pub config_path: String,
+    pub providers_path: String,
+    pub providers: Arc<Vec<crate::config::ProviderInfo>>,
     pub log_tx: broadcast::Sender<String>,
     pub start_time: std::time::Instant,
 }
 
 impl WebState {
-    pub fn new() -> Self {
+    pub fn new(runtime: &crate::config::RuntimeConfig) -> Self {
         let (log_tx, _) = broadcast::channel(256);
         Self {
             stats: Arc::new(Mutex::new(ProxyStats::default())),
             config_path: crate::config::PatternsConfig::config_path_string(),
+            providers_path: runtime.providers_path.clone(),
+            providers: Arc::new(runtime.provider_infos()),
             log_tx,
             start_time: std::time::Instant::now(),
         }
     }
 
     /// Record a proxy request.
-    pub fn record_request(&self, masked: bool, blocked: bool, mask_types: &[String]) {
+    pub fn record_request(
+        &self,
+        provider_name: &str,
+        masked: bool,
+        blocked: bool,
+        mask_types: &[String],
+    ) {
         if let Ok(mut stats) = self.stats.lock() {
             stats.requests_total += 1;
             if masked {
@@ -59,6 +78,21 @@ impl WebState {
             }
             for t in mask_types {
                 *stats.masks_by_type.entry(t.clone()).or_insert(0) += 1;
+            }
+
+            let provider_stats = stats
+                .by_provider
+                .entry(provider_name.to_string())
+                .or_default();
+            provider_stats.requests_total += 1;
+            if masked {
+                provider_stats.requests_masked += 1;
+            }
+            if blocked {
+                provider_stats.requests_blocked += 1;
+            }
+            for t in mask_types {
+                *provider_stats.masks_by_type.entry(t.clone()).or_insert(0) += 1;
             }
         }
     }
@@ -75,6 +109,7 @@ pub fn web_router(state: WebState) -> Router {
         .route("/", get(index_handler))
         .route("/api/status", get(status_handler))
         .route("/api/stats", get(stats_handler))
+        .route("/api/providers", get(get_providers_handler))
         .route("/api/config", get(get_config_handler))
         .route("/api/config", post(update_config_handler))
         .route("/api/patterns", get(get_patterns_handler))
@@ -88,8 +123,6 @@ pub fn web_router(state: WebState) -> Router {
         .with_state(state)
 }
 
-// ─── Handlers ─────────────────────────────────────────────────────
-
 async fn index_handler() -> Html<&'static str> {
     Html(include_str!("web_ui.html"))
 }
@@ -99,6 +132,7 @@ struct StatusResponse {
     status: &'static str,
     version: &'static str,
     uptime_secs: u64,
+    providers_count: usize,
 }
 
 async fn status_handler(State(state): State<WebState>) -> Json<StatusResponse> {
@@ -106,6 +140,7 @@ async fn status_handler(State(state): State<WebState>) -> Json<StatusResponse> {
         status: "running",
         version: env!("CARGO_PKG_VERSION"),
         uptime_secs: state.start_time.elapsed().as_secs(),
+        providers_count: state.providers.len(),
     })
 }
 
@@ -116,30 +151,41 @@ async fn stats_handler(State(state): State<WebState>) -> Json<ProxyStats> {
 }
 
 #[derive(Serialize)]
+struct ProvidersResponse {
+    providers: Vec<crate::config::ProviderInfo>,
+    config_path: String,
+}
+
+async fn get_providers_handler(State(state): State<WebState>) -> Json<ProvidersResponse> {
+    Json(ProvidersResponse {
+        providers: state.providers.as_ref().clone(),
+        config_path: state.providers_path.clone(),
+    })
+}
+
+#[derive(Serialize)]
 struct ConfigResponse {
-    upstream_url: String,
-    bind: String,
-    port: u16,
     sensitivity: String,
     min_score: f32,
     whistledown: bool,
     dry_run: bool,
     audit_log: bool,
     filter_log: String,
+    providers_count: usize,
+    providers_path: String,
 }
 
-async fn get_config_handler() -> Json<ConfigResponse> {
-    let config = crate::config::Config::from_env();
+async fn get_config_handler(State(state): State<WebState>) -> Json<ConfigResponse> {
+    let config = crate::config::RuntimeConfig::from_env().expect("Invalid runtime configuration");
     Json(ConfigResponse {
-        upstream_url: config.upstream_url,
-        bind: config.bind,
-        port: config.port,
         sensitivity: config.sensitivity,
         min_score: config.min_score,
         whistledown: config.whistledown,
         dry_run: config.dry_run,
         audit_log: config.audit_log,
         filter_log: format!("{:?}", config.filter_log),
+        providers_count: state.providers.len(),
+        providers_path: state.providers_path.clone(),
     })
 }
 
@@ -159,10 +205,7 @@ struct ConfigUpdate {
     filter_log: Option<String>,
 }
 
-async fn update_config_handler(
-    Json(update): Json<ConfigUpdate>,
-) -> Response {
-    // Read current env.conf, update values, write back
+async fn update_config_handler(Json(update): Json<ConfigUpdate>) -> Response {
     let env_conf_path = find_env_conf();
     let mut lines: Vec<String> = if let Ok(content) = std::fs::read_to_string(&env_conf_path) {
         content.lines().map(|l| l.to_string()).collect()
@@ -190,8 +233,19 @@ async fn update_config_handler(
     }
 
     match std::fs::write(&env_conf_path, lines.join("\n") + "\n") {
-        Ok(_) => (StatusCode::OK, Json(serde_json::json!({"status": "saved", "note": "Restart proxy to apply changes"}))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to write config: {}", e)).into_response(),
+        Ok(_) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "saved",
+                "note": "Restart proxy to apply changes"
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to write config: {}", e),
+        )
+            .into_response(),
     }
 }
 
@@ -211,13 +265,17 @@ struct PatternInfo {
 
 async fn get_patterns_handler(State(state): State<WebState>) -> Json<PatternResponse> {
     let config = load_patterns_toml(&state.config_path);
-    let patterns: Vec<PatternInfo> = config.pattern.iter().map(|p| PatternInfo {
-        pattern: p.pattern.clone(),
-        replacement: p.replacement.clone(),
-        mask_type: p.mask_type.clone(),
-        score: p.score,
-        action: format!("{:?}", p.action),
-    }).collect();
+    let patterns: Vec<PatternInfo> = config
+        .pattern
+        .iter()
+        .map(|p| PatternInfo {
+            pattern: p.pattern.clone(),
+            replacement: p.replacement.clone(),
+            mask_type: p.mask_type.clone(),
+            score: p.score,
+            action: format!("{:?}", p.action),
+        })
+        .collect();
     Json(PatternResponse { patterns })
 }
 
@@ -225,7 +283,6 @@ async fn add_pattern_handler(
     State(state): State<WebState>,
     Json(new_pattern): Json<PatternInfo>,
 ) -> Response {
-    // Validate regex
     if regex::Regex::new(&new_pattern.pattern).is_err() {
         return (StatusCode::BAD_REQUEST, "Invalid regex pattern").into_response();
     }
@@ -244,8 +301,16 @@ async fn add_pattern_handler(
     });
 
     match save_patterns_toml(&state.config_path, &config) {
-        Ok(_) => (StatusCode::CREATED, Json(serde_json::json!({"status": "added"}))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to save: {}", e)).into_response(),
+        Ok(_) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({"status": "added"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to save: {}", e),
+        )
+            .into_response(),
     }
 }
 
@@ -259,8 +324,16 @@ async fn delete_pattern_handler(
     }
     config.pattern.remove(index);
     match save_patterns_toml(&state.config_path, &config) {
-        Ok(_) => (StatusCode::OK, Json(serde_json::json!({"status": "deleted"}))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to save: {}", e)).into_response(),
+        Ok(_) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "deleted"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to save: {}", e),
+        )
+            .into_response(),
     }
 }
 
@@ -271,7 +344,9 @@ struct AllowlistResponse {
 
 async fn get_allowlist_handler(State(state): State<WebState>) -> Json<AllowlistResponse> {
     let config = load_patterns_toml(&state.config_path);
-    Json(AllowlistResponse { items: config.allowlist })
+    Json(AllowlistResponse {
+        items: config.allowlist,
+    })
 }
 
 #[derive(Deserialize)]
@@ -288,8 +363,16 @@ async fn add_allowlist_handler(
         config.allowlist.push(item.value);
     }
     match save_patterns_toml(&state.config_path, &config) {
-        Ok(_) => (StatusCode::CREATED, Json(serde_json::json!({"status": "added"}))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to save: {}", e)).into_response(),
+        Ok(_) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({"status": "added"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to save: {}", e),
+        )
+            .into_response(),
     }
 }
 
@@ -300,8 +383,16 @@ async fn delete_allowlist_handler(
     let mut config = load_patterns_toml(&state.config_path);
     config.allowlist.retain(|v| v != &value);
     match save_patterns_toml(&state.config_path, &config) {
-        Ok(_) => (StatusCode::OK, Json(serde_json::json!({"status": "deleted"}))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to save: {}", e)).into_response(),
+        Ok(_) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "deleted"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to save: {}", e),
+        )
+            .into_response(),
     }
 }
 
@@ -317,16 +408,16 @@ struct TestMaskResponse {
     detections: Vec<String>,
 }
 
-async fn test_mask_handler(
-    Json(req): Json<TestMaskRequest>,
-) -> Json<TestMaskResponse> {
+async fn test_mask_handler(Json(req): Json<TestMaskRequest>) -> Json<TestMaskResponse> {
     use crate::filter_log::FilterLogger;
     let mut logger = FilterLogger::new(true);
     let mut log = Some(&mut logger);
     let result = crate::patterns::mask_text_full(&req.text, 0.0, &[], &mut log, None);
     let masked = match result {
         crate::patterns::MaskResult::Ok(s) => s,
-        crate::patterns::MaskResult::Blocked { mask_type, .. } => format!("[BLOCKED: {}]", mask_type),
+        crate::patterns::MaskResult::Blocked { mask_type, .. } => {
+            format!("[BLOCKED: {}]", mask_type)
+        }
     };
     let detections = logger.events().iter().map(|e| e.to_string()).collect();
     Json(TestMaskResponse {
@@ -336,10 +427,7 @@ async fn test_mask_handler(
     })
 }
 
-async fn ws_logs_handler(
-    State(state): State<WebState>,
-    ws: WebSocketUpgrade,
-) -> Response {
+async fn ws_logs_handler(State(state): State<WebState>, ws: WebSocketUpgrade) -> Response {
     ws.on_upgrade(move |socket| handle_ws_logs(socket, state))
 }
 
@@ -352,13 +440,13 @@ async fn handle_ws_logs(mut socket: ws::WebSocket, state: WebState) {
     }
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────
-
 fn find_env_conf() -> String {
-    // Look for env.conf in standard locations
     let candidates = [
         std::env::var("MASKFORAI_ENV_CONF").unwrap_or_default(),
-        format!("{}/.config/maskforai/env.conf", std::env::var("HOME").unwrap_or_default()),
+        format!(
+            "{}/.config/maskforai/env.conf",
+            std::env::var("HOME").unwrap_or_default()
+        ),
         "env.conf".to_string(),
     ];
     for c in &candidates {
@@ -366,7 +454,7 @@ fn find_env_conf() -> String {
             return c.clone();
         }
     }
-    candidates[1].clone() // default to XDG config path
+    candidates[1].clone()
 }
 
 fn set_env_line(lines: &mut Vec<String>, key: &str, value: &str) {
@@ -391,30 +479,37 @@ fn load_patterns_toml(config_path: &str) -> crate::config::PatternsConfig {
     }
 }
 
-fn save_patterns_toml(config_path: &str, config: &crate::config::PatternsConfig) -> Result<(), String> {
+fn save_patterns_toml(
+    config_path: &str,
+    config: &crate::config::PatternsConfig,
+) -> Result<(), String> {
     let path = if config_path.is_empty() {
         crate::config::PatternsConfig::config_path_string()
     } else {
         config_path.to_string()
     };
-    // Create parent dirs
     if let Some(parent) = std::path::Path::new(&path).parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
 
-    // Build TOML manually for cleaner output
     let mut output = String::new();
     if !config.allowlist.is_empty() {
         output.push_str("allowlist = [\n");
         for item in &config.allowlist {
-            output.push_str(&format!("    \"{}\",\n", item.replace('\"', "\\\"")));
+            output.push_str(&format!("    \"{}\",\n", item.replace('"', "\\\"")));
         }
         output.push_str("]\n\n");
     }
     for p in &config.pattern {
         output.push_str("[[pattern]]\n");
-        output.push_str(&format!("pattern = \"{}\"\n", p.pattern.replace('\\', "\\\\").replace('\"', "\\\"")));
-        output.push_str(&format!("replacement = \"{}\"\n", p.replacement.replace('\"', "\\\"")));
+        output.push_str(&format!(
+            "pattern = \"{}\"\n",
+            p.pattern.replace('\\', "\\\\").replace('"', "\\\"")
+        ));
+        output.push_str(&format!(
+            "replacement = \"{}\"\n",
+            p.replacement.replace('"', "\\\"")
+        ));
         output.push_str(&format!("mask_type = \"{}\"\n", p.mask_type));
         output.push_str(&format!("score = {:.1}\n", p.score));
         output.push_str(&format!("action = \"{:?}\"\n\n", p.action).to_lowercase());

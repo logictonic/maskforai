@@ -6,6 +6,7 @@ use crate::config::{Config, FilterLogLevel};
 use crate::filter_log::FilterLogger;
 use crate::mask;
 use crate::patterns::MaskResult;
+use crate::web::WebState;
 use crate::whistledown::WhistledownMap;
 use axum::body::Bytes;
 use axum::extract::State;
@@ -22,6 +23,7 @@ use tracing::info;
 pub struct ProxyState {
     pub config: Arc<Config>,
     pub client: Client,
+    pub web_state: Option<WebState>,
 }
 
 impl ProxyState {
@@ -32,7 +34,13 @@ impl ProxyState {
         Self {
             config: Arc::new(config),
             client,
+            web_state: None,
         }
+    }
+
+    pub fn with_web_state(mut self, web_state: WebState) -> Self {
+        self.web_state = Some(web_state);
+        self
     }
 }
 
@@ -87,6 +95,7 @@ pub async fn proxy_handler(
 ) -> Response {
     let path = req.uri().path().to_string();
     let method = req.method().as_str();
+    let request_label = format!("{} {}", method, path);
     let content_type = req
         .headers()
         .get("content-type")
@@ -94,6 +103,10 @@ pub async fn proxy_handler(
         .unwrap_or_else(|| axum::http::HeaderValue::from_static("application/json"));
 
     info!(%method, %path, "Proxying request");
+
+    if let Some(web_state) = &state.web_state {
+        web_state.send_log(&format!("[request] {}", request_label));
+    }
 
     let upstream = format!("{}{}", state.config.upstream_url, req.uri());
 
@@ -124,16 +137,37 @@ pub async fn proxy_handler(
         || path == "/v1/chat/completions"
         || path.ends_with("/v1/chat/completions");
 
-    let dry_run = state.config.dry_run;
+    let is_responses = path == "/responses"
+        || path.ends_with("/responses")
+        || path == "/v1/responses"
+        || path.ends_with("/v1/responses");
 
-    let (body_to_send, whistledown_map) = if is_messages {
+    let is_masked_path = is_messages || is_responses;
+
+    let dry_run = state.config.dry_run;
+    let should_collect_events = state.web_state.is_some() || state.config.filter_log.is_enabled();
+    let should_emit_filter_logs = state.config.filter_log.is_enabled();
+    let logger_detailed = state.config.filter_log == FilterLogLevel::Detailed;
+    let mut logger = if should_collect_events {
+        Some(if should_emit_filter_logs && state.config.audit_log {
+            FilterLogger::with_audit(logger_detailed)
+        } else {
+            FilterLogger::new(logger_detailed)
+        })
+    } else {
+        None
+    };
+    let mut request_masked = false;
+    let mut mask_types: Vec<String> = Vec::new();
+
+    let (body_to_send, whistledown_map) = if is_masked_path {
         if let Ok(mut json) = serde_json::from_slice::<Value>(&body) {
             let min_score = state.config.min_score;
             let allowlist = &state.config.allowlist;
             let whistledown_enabled = state.config.whistledown;
 
-            // Whistledown mode: reversible masking
-            let wmap = if whistledown_enabled && !dry_run {
+            // Whistledown mode: reversible masking (Messages API structure only)
+            let wmap = if whistledown_enabled && !dry_run && is_messages {
                 let mut map = WhistledownMap::new();
                 map.apply(&mut json);
                 if map.has_mappings() {
@@ -149,50 +183,70 @@ pub async fn proxy_handler(
                 None
             };
 
-            // Standard masking (on top of whistledown if both enabled)
-            if state.config.filter_log.is_enabled() {
-                let detailed = state.config.filter_log == FilterLogLevel::Detailed;
-                let mut logger = if state.config.audit_log {
-                    FilterLogger::with_audit(detailed)
+            // Standard masking: Messages API vs Responses API structure
+            let block_result = if let Some(logger) = logger.as_mut() {
+                let mut log = Some(&mut *logger);
+                let block_result = if is_responses {
+                    mask::mask_responses_request_body_full(
+                        &mut json, min_score, allowlist, &mut log,
+                    )
                 } else {
-                    FilterLogger::new(detailed)
+                    mask::mask_request_body_full(&mut json, min_score, allowlist, &mut log)
                 };
-                let mut log = Some(&mut logger);
-                let block_result = mask::mask_request_body_full(&mut json, min_score, allowlist, &mut log);
-                if !dry_run {
-                    if let Some(MaskResult::Blocked { mask_type, matched_preview }) = block_result {
-                        tracing::warn!(
-                            mask_type = %mask_type,
-                            preview = %matched_preview,
-                            path = %path,
-                            "Request BLOCKED: sensitive content detected"
-                        );
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            format!("Request blocked: {} detected", mask_type),
-                        ).into_response();
-                    }
-                }
+                let summary = logger.summary();
+                request_masked = !summary.is_empty();
+                mask_types = summary.keys().cloned().collect();
+
                 if logger.has_events() {
-                    if dry_run {
+                    if dry_run && should_emit_filter_logs {
                         tracing::info!(path = %path, "[DRY-RUN] would have masked");
                     }
-                    logger.emit(&path);
+                    if should_emit_filter_logs {
+                        logger.emit(&path);
+                    }
+                    if let Some(web_state) = &state.web_state {
+                        for event in logger.events() {
+                            web_state.send_log(&format!("[mask] {} :: {}", request_label, event));
+                        }
+                    }
                 }
-            } else if !dry_run {
-                let block_result = mask::mask_request_body_full(&mut json, min_score, allowlist, &mut None);
-                if let Some(MaskResult::Blocked { mask_type, matched_preview }) = block_result {
+
+                block_result
+            } else if is_responses {
+                mask::mask_responses_request_body_full(&mut json, min_score, allowlist, &mut None)
+            } else {
+                mask::mask_request_body_full(&mut json, min_score, allowlist, &mut None)
+            };
+
+            if !dry_run {
+                if let Some(MaskResult::Blocked {
+                    mask_type,
+                    matched_preview,
+                }) = block_result
+                {
                     tracing::warn!(
                         mask_type = %mask_type,
                         preview = %matched_preview,
                         path = %path,
                         "Request BLOCKED: sensitive content detected"
                     );
+                    if let Some(web_state) = &state.web_state {
+                        web_state.record_request(request_masked, true, &mask_types);
+                        web_state.send_log(&format!(
+                            "[blocked] {} :: {} detected",
+                            request_label, mask_type
+                        ));
+                    }
                     return (
                         StatusCode::BAD_REQUEST,
                         format!("Request blocked: {} detected", mask_type),
-                    ).into_response();
+                    )
+                        .into_response();
                 }
+            }
+
+            if let Some(web_state) = &state.web_state {
+                web_state.record_request(request_masked, false, &mask_types);
             }
 
             if dry_run {
@@ -203,23 +257,45 @@ pub async fn proxy_handler(
                     Ok(v) => (Bytes::from(v), wmap),
                     Err(e) => {
                         tracing::error!(error = %e, "Failed to serialize masked body");
-                        return (StatusCode::INTERNAL_SERVER_ERROR, "Serialization error").into_response();
+                        return (StatusCode::INTERNAL_SERVER_ERROR, "Serialization error")
+                            .into_response();
                     }
                 }
             }
         } else {
+            if let Some(web_state) = &state.web_state {
+                web_state.record_request(false, false, &[]);
+            }
             (body, None)
         }
     } else {
+        if let Some(web_state) = &state.web_state {
+            web_state.record_request(false, false, &[]);
+        }
         (body, None)
     };
 
-    let upstream_req = upstream_req.header("content-type", content_type).body(body_to_send);
+    let upstream_req = upstream_req
+        .header("content-type", content_type)
+        .body(body_to_send);
 
-    let upstream_request = upstream_req.build().expect("Failed to build upstream request");
+    let upstream_request = upstream_req
+        .build()
+        .expect("Failed to build upstream request");
     match state.client.execute(upstream_request).await {
         Ok(resp) => {
             let status = resp.status();
+            if let Some(web_state) = &state.web_state {
+                let masked_suffix = if request_masked {
+                    format!(" masked={}", mask_types.join(","))
+                } else {
+                    String::new()
+                };
+                web_state.send_log(&format!(
+                    "[response] {} -> {}{}",
+                    request_label, status, masked_suffix
+                ));
+            }
             let headers = resp.headers().clone();
             let is_sse = headers
                 .get("content-type")
@@ -235,7 +311,9 @@ pub async fn proxy_handler(
 
                     let mapped_stream = byte_stream
                         .map(|r| r.map(Some))
-                        .chain(futures::stream::once(async { Ok::<_, reqwest::Error>(None) }))
+                        .chain(futures::stream::once(async {
+                            Ok::<_, reqwest::Error>(None)
+                        }))
                         .map(move |chunk_result| {
                             match chunk_result {
                                 Ok(Some(bytes)) => {
@@ -273,19 +351,22 @@ pub async fn proxy_handler(
                                     "Whistledown restored tokens in response"
                                 );
                             }
-                            let mut response = Response::new(axum::body::Body::from(unmasked.clone()));
+                            let mut response =
+                                Response::new(axum::body::Body::from(unmasked.clone()));
                             *response.status_mut() = status;
                             *response.headers_mut() = headers;
                             response.headers_mut().remove("content-length");
                             response.headers_mut().insert(
                                 "content-length",
-                                axum::http::HeaderValue::from_str(&unmasked.len().to_string()).unwrap(),
+                                axum::http::HeaderValue::from_str(&unmasked.len().to_string())
+                                    .unwrap(),
                             );
                             response
                         }
                         Err(e) => {
                             tracing::error!(error = %e, "Failed to read upstream response for whistledown");
-                            (StatusCode::BAD_GATEWAY, format!("Response error: {}", e)).into_response()
+                            (StatusCode::BAD_GATEWAY, format!("Response error: {}", e))
+                                .into_response()
                         }
                     }
                 }
@@ -300,11 +381,10 @@ pub async fn proxy_handler(
         }
         Err(e) => {
             tracing::error!(error = ?e, "Upstream request failed");
-            (
-                StatusCode::BAD_GATEWAY,
-                format!("Upstream error: {}", e),
-            )
-                .into_response()
+            if let Some(web_state) = &state.web_state {
+                web_state.send_log(&format!("[error] {} :: upstream {}", request_label, e));
+            }
+            (StatusCode::BAD_GATEWAY, format!("Upstream error: {}", e)).into_response()
         }
     }
 }

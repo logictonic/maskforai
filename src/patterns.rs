@@ -307,6 +307,27 @@ fn rule_set() -> &'static RegexSet {
 
 // ─── Context scoring ───────────────────────────────────────────────
 
+fn floor_char_boundary(text: &str, index: usize) -> usize {
+    let bounded = index.min(text.len());
+    if text.is_char_boundary(bounded) {
+        return bounded;
+    }
+
+    let mut candidate = bounded;
+    while candidate > 0 && !text.is_char_boundary(candidate) {
+        candidate -= 1;
+    }
+    candidate
+}
+
+fn ceil_char_boundary(text: &str, index: usize) -> usize {
+    let mut candidate = index.min(text.len());
+    while candidate < text.len() && !text.is_char_boundary(candidate) {
+        candidate += 1;
+    }
+    candidate
+}
+
 /// Check if any context word appears near a match position.
 fn has_context(text: &str, match_start: usize, match_end: usize, context_words: &[&str]) -> bool {
     if context_words.is_empty() {
@@ -315,8 +336,8 @@ fn has_context(text: &str, match_start: usize, match_end: usize, context_words: 
     let window_start = match_start.saturating_sub(CONTEXT_WINDOW);
     let window_end = (match_end + CONTEXT_WINDOW).min(text.len());
     // Ensure we don't slice mid-char
-    let window_start = text.floor_char_boundary(window_start);
-    let window_end = text.ceil_char_boundary(window_end);
+    let window_start = floor_char_boundary(text, window_start);
+    let window_end = ceil_char_boundary(text, window_end);
     let window = &text[window_start..window_end].to_lowercase();
     context_words.iter().any(|w| window.contains(w))
 }

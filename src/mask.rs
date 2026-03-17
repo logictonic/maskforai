@@ -19,7 +19,8 @@ pub fn mask_request_body_full(
 ) -> Option<MaskResult> {
     if let Some(obj) = body.as_object_mut() {
         if let Some(system) = obj.get_mut("system") {
-            if let Some(block) = mask_value_full(system, min_score, allowlist, log, Some("system")) {
+            if let Some(block) = mask_value_full(system, min_score, allowlist, log, Some("system"))
+            {
                 return Some(block);
             }
         }
@@ -27,10 +28,40 @@ pub fn mask_request_body_full(
             if let Some(arr) = messages.as_array_mut() {
                 for (i, msg) in arr.iter_mut().enumerate() {
                     let ctx = format!("messages.{}", i);
-                    if let Some(block) = mask_message_content_full(msg, min_score, allowlist, log, Some(&ctx)) {
+                    if let Some(block) =
+                        mask_message_content_full(msg, min_score, allowlist, log, Some(&ctx))
+                    {
                         return Some(block);
                     }
                 }
+            }
+        }
+    }
+    None
+}
+
+/// Mask OpenAI Responses API request body.
+pub fn mask_responses_request_body_full(
+    body: &mut Value,
+    min_score: f32,
+    allowlist: &[String],
+    log: &mut Option<&mut FilterLogger>,
+) -> Option<MaskResult> {
+    if let Some(obj) = body.as_object_mut() {
+        if let Some(instructions) = obj.get_mut("instructions") {
+            if let Some(block) = mask_value_full(
+                instructions,
+                min_score,
+                allowlist,
+                log,
+                Some("instructions"),
+            ) {
+                return Some(block);
+            }
+        }
+        if let Some(input) = obj.get_mut("input") {
+            if let Some(block) = mask_value_full(input, min_score, allowlist, log, Some("input")) {
+                return Some(block);
             }
         }
     }
@@ -51,10 +82,7 @@ fn mask_message_content_full(
     context: Option<&str>,
 ) -> Option<MaskResult> {
     if let Some(obj) = msg.as_object_mut() {
-        let role = obj
-            .get("role")
-            .and_then(|v| v.as_str())
-            .unwrap_or("?");
+        let role = obj.get("role").and_then(|v| v.as_str()).unwrap_or("?");
         let ctx = context.map(|c| format!("{}.{}", c, role));
         if let Some(content) = obj.get_mut("content") {
             return mask_content_full(content, min_score, allowlist, log, ctx.as_deref());
@@ -139,8 +167,11 @@ fn mask_value_full(
             None
         }
         Value::Object(obj) => {
-            for (_, val) in obj.iter_mut() {
-                if let Some(blocked) = mask_value_full(val, min_score, allowlist, log, context) {
+            for (key, val) in obj.iter_mut() {
+                let child_context = context.map(|c| format!("{}.{}", c, key));
+                if let Some(blocked) =
+                    mask_value_full(val, min_score, allowlist, log, child_context.as_deref())
+                {
                     return Some(blocked);
                 }
             }
@@ -223,7 +254,11 @@ mod tests {
         // Should mask, not block
         assert!(result.is_none(), "Should not block");
         let content = body["messages"][0]["content"].as_str().unwrap();
-        assert!(content.contains("[masked:private_key]"), "PEM not masked: {}", content);
+        assert!(
+            content.contains("[masked:private_key]"),
+            "PEM not masked: {}",
+            content
+        );
     }
 
     #[test]
@@ -237,7 +272,10 @@ mod tests {
         let result = mask_request_body_full(&mut body, 0.8, &[], &mut None);
         assert!(result.is_none());
         let content = body["messages"][0]["content"].as_str().unwrap();
-        assert!(content.contains("+79991234567"), "Phone should not be masked at 0.8 threshold");
+        assert!(
+            content.contains("+79991234567"),
+            "Phone should not be masked at 0.8 threshold"
+        );
     }
 
     #[test]
@@ -250,6 +288,9 @@ mod tests {
         let allowlist = vec!["admin@company.internal".to_string()];
         mask_request_body_full(&mut body, 0.0, &allowlist, &mut None);
         let content = body["messages"][0]["content"].as_str().unwrap();
-        assert!(content.contains("admin@company.internal"), "Allowlisted email should not be masked");
+        assert!(
+            content.contains("admin@company.internal"),
+            "Allowlisted email should not be masked"
+        );
     }
 }

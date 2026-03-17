@@ -368,7 +368,7 @@ function toggleWs(){
   ws=new WebSocket(proto+'//'+location.host+'/ws/logs');
   ws.onopen=()=>{btn.textContent='Disconnect';addLog('[connected]','info');};
   ws.onclose=()=>{btn.textContent='Connect';ws=null;addLog('[disconnected]','info');};
-  ws.onmessage=(e)=>addLog(e.data,'mask');
+  ws.onmessage=(e)=>{addLog(e.data,'mask');loadStats();};
 }
 
 function addLog(msg,cls){
@@ -387,7 +387,8 @@ function esc(s){const d=document.createElement('div');d.textContent=s;return d.i
 
 // Init
 loadStatus();loadConfig();loadStats();
-setInterval(loadStats,5000);
+toggleWs();
+setInterval(loadStats,1000);
 </script>
 </body>
 </html>

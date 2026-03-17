@@ -10,12 +10,20 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 #[tokio::main]
 async fn main() {
     tracing_subscriber::registry()
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| "maskforai=info,tower_http=info".into()))
+        .with(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "maskforai=info,tower_http=info".into()),
+        )
         .with(tracing_subscriber::fmt::layer())
         .init();
 
     let config = maskforai::config::Config::from_env();
-    let state = ProxyState::new(config.clone());
+    let web_state = (config.web_port > 0).then(WebState::new);
+    let state = if let Some(web_state) = &web_state {
+        ProxyState::new(config.clone()).with_web_state(web_state.clone())
+    } else {
+        ProxyState::new(config.clone())
+    };
 
     let app = Router::new()
         .fallback(maskforai::proxy::proxy_handler)
@@ -34,7 +42,7 @@ async fn main() {
     // Start Web UI on separate port
     let web_port = config.web_port;
     if web_port > 0 {
-        let web_state = WebState::new();
+        let web_state = web_state.expect("web state must exist when web UI is enabled");
         let web_app = web::web_router(web_state);
         let web_addr: SocketAddr = format!("{}:{}", config.bind, web_port)
             .parse()
@@ -43,11 +51,17 @@ async fn main() {
         tracing::info!("Web UI available at http://{}", web_addr);
 
         tokio::spawn(async move {
-            let listener = tokio::net::TcpListener::bind(web_addr).await.expect("Web UI bind failed");
-            axum::serve(listener, web_app).await.expect("Web UI server failed");
+            let listener = tokio::net::TcpListener::bind(web_addr)
+                .await
+                .expect("Web UI bind failed");
+            axum::serve(listener, web_app)
+                .await
+                .expect("Web UI server failed");
         });
     }
 
-    let listener = tokio::net::TcpListener::bind(addr).await.expect("Bind failed");
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .expect("Bind failed");
     axum::serve(listener, app).await.expect("Server failed");
 }

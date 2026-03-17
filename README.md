@@ -103,7 +103,7 @@ Set `MASKFORAI_WEB_PORT=0` to disable the web UI.
 | `MASKFORAI_UPSTREAM` | (from ANTHROPIC_BASE_URL) | Upstream API URL |
 | `MASKFORAI_LOG_FILTER` | off | Filter logging: `off`, `summary`, `detailed` |
 | `MASKFORAI_SENSITIVITY` | medium | Sensitivity: `low`, `medium`, `high`, `paranoid` |
-| `MASKFORAI_WHISTLEDOWN` | false | Reversible masking with numbered tokens |
+| `MASKFORAI_WHISTLEDOWN` | true | Reversible masking with numbered tokens |
 | `MASKFORAI_DRY_RUN` | false | Log detections but don't modify traffic |
 | `MASKFORAI_WEB_PORT` | 8433 | Web UI port (0 = disabled) |
 | `MASKFORAI_MIN_SCORE` | 0.0 | Minimum confidence score (0.0–1.0) |

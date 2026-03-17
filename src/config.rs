@@ -178,7 +178,7 @@ impl Config {
 
         let whistledown = env::var("MASKFORAI_WHISTLEDOWN")
             .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
-            .unwrap_or(false);
+            .unwrap_or(true);
 
         let sensitivity = env::var("MASKFORAI_SENSITIVITY")
             .unwrap_or_else(|_| "medium".to_string());

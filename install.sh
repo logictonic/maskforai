@@ -198,9 +198,9 @@ MASKFORAI_UPSTREAM=$upstream
 # Audit log: log SHA256 hashes of masked values (default: off)
 # MASKFORAI_AUDIT_LOG=false
 
-# Whistledown: reversible masking with numbered tokens (default: off)
+# Whistledown: reversible masking with numbered tokens (default: on)
 # When enabled, PII is replaced with [[TYPE_N]] tokens and restored in responses
-# MASKFORAI_WHISTLEDOWN=false
+MASKFORAI_WHISTLEDOWN=true
 EOF
         echo "==> Created config template: $conf"
         echo "    Edit it to change MASKFORAI_UPSTREAM if needed"

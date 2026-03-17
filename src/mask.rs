@@ -60,7 +60,9 @@ pub fn mask_responses_request_body_full(
             }
         }
         if let Some(input) = obj.get_mut("input") {
-            if let Some(block) = mask_value_full(input, min_score, allowlist, log, Some("input")) {
+            if let Some(block) =
+                mask_responses_value_full(input, min_score, allowlist, log, Some("input"))
+            {
                 return Some(block);
             }
         }
@@ -181,6 +183,61 @@ fn mask_value_full(
     }
 }
 
+fn mask_responses_value_full(
+    v: &mut Value,
+    min_score: f32,
+    allowlist: &[String],
+    log: &mut Option<&mut FilterLogger>,
+    context: Option<&str>,
+) -> Option<MaskResult> {
+    match v {
+        Value::String(s) => {
+            let result = patterns::mask_text_full(s, min_score, allowlist, log, context);
+            match result {
+                MaskResult::Ok(masked) => {
+                    *s = masked;
+                    None
+                }
+                blocked @ MaskResult::Blocked { .. } => Some(blocked),
+            }
+        }
+        Value::Array(arr) => {
+            for item in arr.iter_mut() {
+                if let Some(blocked) =
+                    mask_responses_value_full(item, min_score, allowlist, log, context)
+                {
+                    return Some(blocked);
+                }
+            }
+            None
+        }
+        Value::Object(obj) => {
+            for (key, val) in obj.iter_mut() {
+                if is_opaque_responses_field(key) {
+                    continue;
+                }
+                let child_context = context.map(|c| format!("{}.{}", c, key));
+                if let Some(blocked) = mask_responses_value_full(
+                    val,
+                    min_score,
+                    allowlist,
+                    log,
+                    child_context.as_deref(),
+                ) {
+                    return Some(blocked);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn is_opaque_responses_field(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key.contains("encrypted") || matches!(key.as_str(), "ciphertext" | "auth_tag" | "tag" | "iv")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,6 +277,26 @@ mod tests {
         mask_request_body(&mut body);
         let text = body["messages"][0]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("[masked:email]"));
+    }
+
+    #[test]
+    fn responses_masking_skips_encrypted_fields() {
+        let ciphertext = "gAAAABkFakeCiphertextHeDH";
+        let mut body = serde_json::json!({
+            "input": [{
+                "role": "user",
+                "content": "Email me at [masked:email]****",
+                "encrypted_content": ciphertext
+            }]
+        });
+        let result = mask_responses_request_body_full(&mut body, 0.0, &[], &mut None);
+        assert!(result.is_none(), "Should not block");
+        let content = body["input"][0]["content"].as_str().unwrap();
+        assert!(content.contains("[masked:email]"));
+        assert_eq!(
+            body["input"][0]["encrypted_content"].as_str().unwrap(),
+            ciphertext
+        );
     }
 
     #[test]

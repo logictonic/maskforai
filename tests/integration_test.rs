@@ -128,6 +128,44 @@ async fn proxy_masks_responses_api_request() {
 }
 
 #[tokio::test]
+async fn proxy_preserves_responses_api_encrypted_content() {
+    let mock_server = MockServer::start_async().await;
+    let ciphertext = "gAAAABkFakeCiphertextHeDH";
+
+    let capture = mock_server
+        .mock_async(move |when, then| {
+            when.method(POST)
+                .path("/responses")
+                .body_contains(ciphertext)
+                .body_contains("[masked:email]");
+            then.status(200)
+                .body(r#"{"id":"resp_123","object":"response"}"#);
+        })
+        .await;
+
+    let config = test_config(mock_server.base_url());
+    let state = ProxyState::new(config);
+
+    let app = Router::new().fallback(proxy_handler).with_state(state);
+
+    let body = format!(
+        r#"{{"model":"gpt-5","input":[{{"role":"user","content":"Contact me at [masked:email]****","encrypted_content":"{}"}}]}}"#,
+        ciphertext
+    );
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/responses")
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+
+    let response = app.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    capture.assert_async().await;
+}
+
+#[tokio::test]
 async fn proxy_logs_filter_events_when_enabled() {
     let mock_server = MockServer::start_async().await;
 

@@ -514,5 +514,16 @@ fn save_patterns_toml(
         output.push_str(&format!("score = {:.1}\n", p.score));
         output.push_str(&format!("action = \"{:?}\"\n\n", p.action).to_lowercase());
     }
+    for w in &config.whistledown_pattern {
+        output.push_str("[[whistledown_pattern]]\n");
+        output.push_str(&format!(
+            "regex = \"{}\"\n",
+            w.regex.replace('\\', "\\\\").replace('"', "\\\"")
+        ));
+        output.push_str(&format!(
+            "entity_type = \"{}\"\n\n",
+            w.entity_type.replace('"', "\\\"")
+        ));
+    }
     std::fs::write(&path, output).map_err(|e| e.to_string())
 }

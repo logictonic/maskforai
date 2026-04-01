@@ -55,12 +55,21 @@ pub enum CustomAction {
     Observe,
 }
 
+/// Extra Whistledown regex rules loaded from `patterns.toml` (`[[whistledown_pattern]]`).
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct WhistledownPatternDef {
+    pub regex: String,
+    pub entity_type: String,
+}
+
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 pub struct PatternsConfig {
     #[serde(default)]
     pub pattern: Vec<CustomPatternDef>,
     #[serde(default)]
     pub allowlist: Vec<String>,
+    #[serde(default)]
+    pub whistledown_pattern: Vec<WhistledownPatternDef>,
 }
 
 impl PatternsConfig {
@@ -157,6 +166,8 @@ pub struct Config {
     pub sensitivity: String,
     pub dry_run: bool,
     pub web_port: u16,
+    /// When true, use HTTP/1.1 only to upstream (often more stable for SSE through nginx relays).
+    pub http1_only: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -255,6 +266,7 @@ struct GlobalConfig {
     sensitivity: String,
     dry_run: bool,
     web_port: u16,
+    http1_only: bool,
 }
 
 impl GlobalConfig {
@@ -293,6 +305,9 @@ impl GlobalConfig {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(8433);
+        let http1_only = env::var("MASKFORAI_HTTP1_ONLY")
+            .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false);
         let custom_patterns = PatternsConfig::load();
         let mut all_allowlist = allowlist;
         all_allowlist.extend(custom_patterns.allowlist.clone());
@@ -310,6 +325,7 @@ impl GlobalConfig {
             sensitivity,
             dry_run,
             web_port,
+            http1_only,
         }
     }
 
@@ -356,6 +372,7 @@ impl GlobalConfig {
             sensitivity: self.sensitivity.clone(),
             dry_run: self.dry_run,
             web_port: self.web_port,
+            http1_only: self.http1_only,
         }
     }
 }
@@ -454,6 +471,7 @@ upstream_url = "https://api.openai.com/v1"
                 sensitivity: "medium".into(),
                 dry_run: false,
                 web_port: 8433,
+                http1_only: false,
             },
             Config {
                 provider_name: "openai".into(),
@@ -470,6 +488,7 @@ upstream_url = "https://api.openai.com/v1"
                 sensitivity: "medium".into(),
                 dry_run: false,
                 web_port: 8433,
+                http1_only: false,
             },
         ];
 

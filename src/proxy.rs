@@ -7,10 +7,10 @@ use crate::filter_log::FilterLogger;
 use crate::mask;
 use crate::patterns::MaskResult;
 use crate::web::WebState;
-use crate::whistledown::WhistledownMap;
+use crate::whistledown::{WhistledownMap, WhistledownPatternSet};
 use axum::body::Bytes;
 use axum::extract::State;
-use axum::http::{Request, StatusCode};
+use axum::http::{HeaderMap, HeaderName, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures::stream::StreamExt;
 use reqwest::Client;
@@ -24,17 +24,30 @@ pub struct ProxyState {
     pub config: Arc<Config>,
     pub client: Client,
     pub web_state: Option<WebState>,
+    pub whistledown_patterns: Arc<WhistledownPatternSet>,
 }
 
 impl ProxyState {
     pub fn new(config: Config) -> Self {
-        let client = Client::builder()
-            .build()
-            .expect("Failed to create HTTP client");
+        let mut builder = Client::builder();
+        if config.http1_only {
+            builder = builder.http1_only();
+        }
+        let client = builder.build().expect("Failed to create HTTP client");
+        if config.http1_only {
+            tracing::info!(
+                provider = %config.provider_name,
+                "Upstream HTTP client: HTTP/1.1 only (MASKFORAI_HTTP1_ONLY)"
+            );
+        }
+        let whistledown_patterns = Arc::new(WhistledownPatternSet::compile_from_patterns_config(
+            &config.custom_patterns,
+        ));
         Self {
             config: Arc::new(config),
             client,
             web_state: None,
+            whistledown_patterns,
         }
     }
 
@@ -86,6 +99,19 @@ impl SseRehydrator {
         self.buffer.clear();
         restored
     }
+}
+
+/// Drop hop-by-hop / framing headers before attaching a new streamed body.
+/// Hyper sets `Transfer-Encoding` for the client; forwarding upstream
+/// `Connection`, `Transfer-Encoding`, or `Content-Length` breaks some clients (e.g. SSE consumers).
+fn sanitize_streaming_response_headers(headers: &mut HeaderMap) {
+    headers.remove(axum::http::header::CONNECTION);
+    headers.remove(axum::http::header::TRANSFER_ENCODING);
+    headers.remove(axum::http::header::CONTENT_LENGTH);
+    headers.remove(HeaderName::from_static("keep-alive"));
+    headers.remove(axum::http::header::TE);
+    headers.remove(axum::http::header::TRAILER);
+    headers.remove(axum::http::header::UPGRADE);
 }
 
 /// Proxy handler: intercept, mask, and forward.
@@ -177,16 +203,17 @@ pub async fn proxy_handler(
             let allowlist = &state.config.allowlist;
             let whistledown_enabled = state.config.whistledown;
 
-            // Whistledown mode: reversible masking (Messages API structure only)
-            let wmap = if whistledown_enabled
-                && !dry_run
-                && is_messages
-                && matches!(
-                    state.config.provider_type,
-                    ProviderType::Claude | ProviderType::Compatible
-                ) {
-                let mut map = WhistledownMap::new();
-                map.apply(&mut json);
+            // Whistledown: reversible tokens on Messages, chat completions, or Responses API shapes.
+            let wmap = if whistledown_enabled && !dry_run && (is_messages || is_responses) {
+                let mut map = WhistledownMap::new(
+                    state.whistledown_patterns.clone(),
+                    state.config.allowlist.clone(),
+                );
+                if is_messages {
+                    map.apply(&mut json);
+                } else {
+                    map.apply_responses(&mut json);
+                }
                 if map.has_mappings() {
                     tracing::info!(
                         path = %path,
@@ -312,6 +339,14 @@ pub async fn proxy_handler(
     match state.client.execute(upstream_request).await {
         Ok(resp) => {
             let status = resp.status();
+            if !status.is_success() {
+                tracing::warn!(
+                    provider = %state.config.provider_name,
+                    path = %path,
+                    status = %status,
+                    "Upstream returned non-success status (Codex may retry and show 'high demand')"
+                );
+            }
             if let Some(web_state) = &state.web_state {
                 let masked_suffix = if request_masked {
                     format!(" masked={}", mask_types.join(","))
@@ -363,7 +398,7 @@ pub async fn proxy_handler(
                     let mut response = Response::new(body);
                     *response.status_mut() = status;
                     let mut resp_headers = headers;
-                    resp_headers.remove("content-length"); // SSE has no fixed length
+                    sanitize_streaming_response_headers(&mut resp_headers);
                     *response.headers_mut() = resp_headers;
                     response
                 } else {
@@ -398,11 +433,15 @@ pub async fn proxy_handler(
                     }
                 }
             } else {
-                // Standard streaming passthrough
+                // Standard streaming passthrough — do not forward upstream framing headers;
+                // Hyper sets transfer-encoding for the client. Forwarding Connection/TE/CL breaks
+                // some SSE/HTTP2 clients (e.g. Codex) mid-stream.
                 let body = axum::body::Body::from_stream(resp.bytes_stream());
                 let mut response = Response::new(body);
                 *response.status_mut() = status;
-                *response.headers_mut() = headers;
+                let mut resp_headers = headers;
+                sanitize_streaming_response_headers(&mut resp_headers);
+                *response.headers_mut() = resp_headers;
                 response
             }
         }

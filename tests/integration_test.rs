@@ -24,6 +24,7 @@ fn test_config(upstream_url: String) -> Config {
         sensitivity: "medium".to_string(),
         dry_run: false,
         web_port: 0,
+        http1_only: false,
     }
 }
 
@@ -337,6 +338,144 @@ async fn proxy_whistledown_mode() {
     assert!(
         resp_str.contains("user@secret.com"),
         "Whistledown should restore email in response: {}",
+        resp_str
+    );
+    assert!(
+        !resp_str.contains("[[EMAIL_1]]"),
+        "Token should be replaced: {}",
+        resp_str
+    );
+}
+
+#[tokio::test]
+async fn proxy_whistledown_masks_brands_in_identifiers() {
+    let mock_server = MockServer::start_async().await;
+
+    let capture = mock_server
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/v1/messages")
+                .body_contains("[[BRAND_");
+            then.status(200).body(
+                r#"{"id":"msg_123","type":"message","content":[{"type":"text","text":"Use [[BRAND_1]]Platform and [[BRAND_2]]_utils"}]}"#,
+            );
+        })
+        .await;
+
+    let mut config = test_config(mock_server.base_url());
+    config.whistledown = true;
+    let state = ProxyState::new(config);
+
+    let app = Router::new()
+        .fallback(proxy_handler)
+        .with_state(state);
+
+    let body = r#"{"model":"claude-3-5-sonnet","messages":[{"role":"user","content":"Use LifelyPlatform and itneuro_utils"}]}"#;
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/messages")
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+
+    let response = app.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    capture.assert_async().await;
+}
+
+#[tokio::test]
+async fn proxy_whistledown_openai_chat_completions() {
+    let mock_server = MockServer::start_async().await;
+
+    let capture = mock_server
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .body_contains("[[EMAIL_1]]");
+            then.status(200).body(
+                r#"{"id":"chatcmpl-1","choices":[{"message":{"role":"assistant","content":"Sent mail to [[EMAIL_1]]"}}]}"#,
+            );
+        })
+        .await;
+
+    let mut config = test_config(mock_server.base_url());
+    config.provider_type = ProviderType::Openai;
+    config.whistledown = true;
+    let state = ProxyState::new(config);
+
+    let app = Router::new().fallback(proxy_handler).with_state(state);
+
+    let body = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"Email user@secret.com"}]}"#;
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+
+    let response = app.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    capture.assert_async().await;
+
+    let resp_body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let resp_str = String::from_utf8_lossy(&resp_body);
+    assert!(
+        resp_str.contains("user@secret.com"),
+        "Whistledown should restore email: {}",
+        resp_str
+    );
+    assert!(
+        !resp_str.contains("[[EMAIL_1]]"),
+        "Token should be replaced: {}",
+        resp_str
+    );
+}
+
+#[tokio::test]
+async fn proxy_whistledown_responses_api() {
+    let mock_server = MockServer::start_async().await;
+
+    let capture = mock_server
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/v1/responses")
+                .body_contains("[[EMAIL_1]]");
+            then.status(200).body(
+                r#"{"id":"resp_wd","object":"response","output":[{"content":[{"text":"Replied to [[EMAIL_1]]"}]}]}"#,
+            );
+        })
+        .await;
+
+    let mut config = test_config(mock_server.base_url());
+    config.whistledown = true;
+    let state = ProxyState::new(config);
+
+    let app = Router::new().fallback(proxy_handler).with_state(state);
+
+    let body = r#"{"model":"gpt-5","input":"Contact user@secret.com please"}"#;
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/responses")
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+
+    let response = app.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    capture.assert_async().await;
+
+    let resp_body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let resp_str = String::from_utf8_lossy(&resp_body);
+    assert!(
+        resp_str.contains("user@secret.com"),
+        "Whistledown should restore in Responses flow: {}",
         resp_str
     );
     assert!(

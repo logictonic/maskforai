@@ -114,6 +114,22 @@ fn sanitize_streaming_response_headers(headers: &mut HeaderMap) {
     headers.remove(axum::http::header::UPGRADE);
 }
 
+/// Remove hop-by-hop headers and install a correct content length
+/// for fully buffered upstream responses.
+fn finalize_buffered_response_headers(headers: &mut HeaderMap, body_len: usize) {
+    headers.remove(axum::http::header::CONNECTION);
+    headers.remove(axum::http::header::TRANSFER_ENCODING);
+    headers.remove(HeaderName::from_static("keep-alive"));
+    headers.remove(axum::http::header::TE);
+    headers.remove(axum::http::header::TRAILER);
+    headers.remove(axum::http::header::UPGRADE);
+    headers.remove(axum::http::header::CONTENT_LENGTH);
+    headers.insert(
+        axum::http::header::CONTENT_LENGTH,
+        axum::http::HeaderValue::from_str(&body_len.to_string()).unwrap(),
+    );
+}
+
 /// Proxy handler: intercept, mask, and forward.
 pub async fn proxy_handler(
     State(state): State<ProxyState>,
@@ -433,16 +449,43 @@ pub async fn proxy_handler(
                     }
                 }
             } else {
-                // Standard streaming passthrough — do not forward upstream framing headers;
-                // Hyper sets transfer-encoding for the client. Forwarding Connection/TE/CL breaks
-                // some SSE/HTTP2 clients (e.g. Codex) mid-stream.
-                let body = axum::body::Body::from_stream(resp.bytes_stream());
-                let mut response = Response::new(body);
-                *response.status_mut() = status;
-                let mut resp_headers = headers;
-                sanitize_streaming_response_headers(&mut resp_headers);
-                *response.headers_mut() = resp_headers;
-                response
+                if is_responses {
+                    // `/responses` has proven fragile with direct passthrough on some clients.
+                    // Buffer the full upstream reply and return a clean response instead.
+                    match resp.bytes().await {
+                        Ok(body_bytes) => {
+                            let mut response =
+                                Response::new(axum::body::Body::from(body_bytes.clone()));
+                            *response.status_mut() = status;
+                            let mut resp_headers = headers;
+                            finalize_buffered_response_headers(
+                                &mut resp_headers,
+                                body_bytes.len(),
+                            );
+                            *response.headers_mut() = resp_headers;
+                            response
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                error = %e,
+                                "Failed to read upstream response for /responses"
+                            );
+                            (StatusCode::BAD_GATEWAY, format!("Response error: {}", e))
+                                .into_response()
+                        }
+                    }
+                } else {
+                    // Standard streaming passthrough — do not forward upstream framing headers;
+                    // Hyper sets transfer-encoding for the client. Forwarding Connection/TE/CL breaks
+                    // some SSE/HTTP2 clients (e.g. Codex) mid-stream.
+                    let body = axum::body::Body::from_stream(resp.bytes_stream());
+                    let mut response = Response::new(body);
+                    *response.status_mut() = status;
+                    let mut resp_headers = headers;
+                    sanitize_streaming_response_headers(&mut resp_headers);
+                    *response.headers_mut() = resp_headers;
+                    response
+                }
             }
         }
         Err(e) => {

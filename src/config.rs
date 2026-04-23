@@ -418,12 +418,67 @@ pub fn providers_config_path_string() -> String {
 }
 
 fn dirs_config_dir() -> PathBuf {
-    env::var("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-            PathBuf::from(home).join(".config")
-        })
+    if let Ok(p) = env::var("XDG_CONFIG_HOME") {
+        return PathBuf::from(p);
+    }
+    if let Ok(userprofile) = env::var("USERPROFILE") {
+        return PathBuf::from(userprofile).join(".config");
+    }
+    if let Ok(home) = env::var("HOME") {
+        return PathBuf::from(home).join(".config");
+    }
+    PathBuf::from("/tmp").join(".config")
+}
+
+/// Path to `env.conf` next to `providers.toml` (same as systemd `EnvironmentFile` on Linux).
+pub fn env_config_path() -> PathBuf {
+    if let Ok(p) = env::var("MASKFORAI_ENV_FILE") {
+        return PathBuf::from(p);
+    }
+    dirs_config_dir().join("maskforai").join("env.conf")
+}
+
+/// Load `KEY=VALUE` lines from `env.conf` into the process environment (does not override
+/// already-set variables). Enables `HTTP(S)_PROXY` / `ALL_PROXY` for the upstream `reqwest`
+/// client without a shell or systemd, including on Windows.
+pub fn load_optional_env_file() -> bool {
+    let path = env_config_path();
+    if !path.exists() {
+        return false;
+    }
+    let content = match fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "maskforai: could not read {}: {}",
+                path.display(),
+                e
+            );
+            return false;
+        }
+    };
+    for raw in content.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line
+            .strip_prefix("export ")
+            .map(str::trim)
+            .unwrap_or(line);
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if key.is_empty() {
+            continue;
+        }
+        let value = value.trim();
+        if std::env::var_os(key).is_none() {
+            std::env::set_var(key, value);
+        }
+    }
+    true
 }
 
 #[cfg(test)]

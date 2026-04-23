@@ -92,6 +92,14 @@ cd maskforai
 cargo build --release
 ```
 
+## Windows
+
+There is no `install.sh`; use `cargo build --release` and run `target\release\maskforai.exe`.
+
+- **Config directory:** `%USERPROFILE%\.config\maskforai\` for `providers.toml` and `patterns.toml` when `XDG_CONFIG_HOME` is not set (otherwise `XDG_CONFIG_HOME\maskforai\` as on Linux). You can still point to specific files with `MASKFORAI_PROVIDERS_FILE`, `MASKFORAI_PATTERNS_FILE`, and `MASKFORAI_ENV_FILE`.
+- **`env.conf`:** On startup, the process loads optional `KEY=VALUE` lines from `env.conf` in that directory (same idea as the Linux systemd `EnvironmentFile`). Existing environment variables are not overwritten. Use this for `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY` so upstream traffic uses your local HTTP or SOCKS proxy (e.g. V2Ray) without a wrapper script.
+- **Binary path:** add `target\release` to your `PATH` or copy `maskforai.exe` where you prefer.
+
 ## Configure global defaults
 
 `env.conf` now holds global masking defaults and legacy single-provider fallback:

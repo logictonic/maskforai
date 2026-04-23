@@ -10,6 +10,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 
 #[tokio::main]
 async fn main() {
+    let loaded_env = maskforai::config::load_optional_env_file();
     tracing_subscriber::registry()
         .with(
             EnvFilter::try_from_default_env()
@@ -17,6 +18,13 @@ async fn main() {
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
+
+    if loaded_env {
+        tracing::info!(
+            path = %maskforai::config::env_config_path().display(),
+            "Loaded env.conf (HTTP_PROXY and related vars apply to upstream if set)"
+        );
+    }
 
     let runtime = RuntimeConfig::from_env().expect("Invalid runtime configuration");
     let web_state = (runtime.web_port > 0).then(|| WebState::new(&runtime));

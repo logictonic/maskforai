@@ -13,7 +13,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, HeaderName, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures::stream::StreamExt;
-use reqwest::Client;
+use reqwest::{Client, NoProxy, Proxy};
 use serde_json::Value;
 use std::sync::Arc;
 use tracing::info;
@@ -27,13 +27,97 @@ pub struct ProxyState {
     pub whistledown_patterns: Arc<WhistledownPatternSet>,
 }
 
+fn first_env(names: &[&'static str]) -> Option<String> {
+    for name in names {
+        if let Ok(v) = std::env::var(name) {
+            let t = v.trim();
+            if !t.is_empty() {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+fn no_proxy_value() -> Option<NoProxy> {
+    first_env(&["NO_PROXY", "no_proxy"])
+        .as_ref()
+        .and_then(|s| NoProxy::from_string(s))
+}
+
+/// Build reqwest with explicit `HTTP(S)_PROXY` / `ALL_PROXY` from the environment.
+/// `reqwest` only applies the default system/env proxy matcher if you never call
+/// [`ClientBuilder::proxy`]; that path is easy to get wrong, so we configure proxies
+/// explicitly when any of the usual env vars is set.
+fn build_reqwest_from_env(config: &Config) -> reqwest::Client {
+    let mut base = Client::builder();
+    if config.http1_only {
+        base = base.http1_only();
+    }
+    let no = no_proxy_value();
+
+    if let Some(url) = first_env(&["ALL_PROXY", "all_proxy"]) {
+        match Proxy::all(&url) {
+            Ok(p) => {
+                if let Ok(c) = base.proxy(p.no_proxy(no.clone())).build() {
+                    return c;
+                }
+                tracing::warn!("Failed to build client with ALL_PROXY; trying HTTP/HTTPS or default");
+            }
+            Err(e) => tracing::warn!(error = %e, "Invalid ALL_PROXY"),
+        }
+    }
+
+    let mut b = {
+        let mut b = Client::builder();
+        if config.http1_only {
+            b = b.http1_only();
+        }
+        b
+    };
+    let mut n = 0;
+    if let Some(url) = first_env(&["HTTP_PROXY", "http_proxy"]) {
+        match Proxy::http(&url) {
+            Ok(p) => {
+                b = b.proxy(p.no_proxy(no.clone()));
+                n += 1;
+            }
+            Err(e) => tracing::warn!(error = %e, "Invalid HTTP_PROXY"),
+        }
+    }
+    if let Some(url) = first_env(&["HTTPS_PROXY", "https_proxy"]) {
+        match Proxy::https(&url) {
+            Ok(p) => {
+                b = b.proxy(p.no_proxy(no));
+                n += 1;
+            }
+            Err(e) => tracing::warn!(error = %e, "Invalid HTTPS_PROXY"),
+        }
+    }
+    if n == 0 {
+        return {
+            let mut b = Client::builder();
+            if config.http1_only {
+                b = b.http1_only();
+            }
+            b.build()
+        }
+        .expect("Failed to create HTTP client");
+    }
+    b.build().expect("Failed to create HTTP client with explicit env proxies")
+}
+
 impl ProxyState {
     pub fn new(config: Config) -> Self {
-        let mut builder = Client::builder();
-        if config.http1_only {
-            builder = builder.http1_only();
+        let has_proxy_env = first_env(&["ALL_PROXY", "all_proxy", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"])
+            .is_some();
+        if has_proxy_env {
+            tracing::info!(
+                provider = %config.provider_name,
+                "Upstream HTTP client: using HTTP_PROXY / HTTPS_PROXY / ALL_PROXY from process environment (URLs not logged)"
+            );
         }
-        let client = builder.build().expect("Failed to create HTTP client");
+        let client = build_reqwest_from_env(&config);
         if config.http1_only {
             tracing::info!(
                 provider = %config.provider_name,

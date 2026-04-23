@@ -457,8 +457,9 @@ pub fn load_optional_env_file() -> bool {
             return false;
         }
     };
+    let content = content.trim_start_matches('\u{feff}');
     for raw in content.lines() {
-        let line = raw.trim();
+        let line = raw.trim().trim_start_matches('\u{feff}');
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
@@ -469,7 +470,7 @@ pub fn load_optional_env_file() -> bool {
         let Some((key, value)) = line.split_once('=') else {
             continue;
         };
-        let key = key.trim();
+        let key = key.trim().trim_start_matches('\u{feff}');
         if key.is_empty() {
             continue;
         }

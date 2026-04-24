@@ -17,8 +17,8 @@ Local HTTP proxy that masks sensitive data (API keys, passwords, PII) in Claude 
 The installer will:
 1. Detect distro and install build dependencies (gcc, curl) if needed
 2. Install Rust via rustup if `cargo` is not present
-3. Build from source and install to `~/.local/bin/maskforai`
-4. Create `~/.config/maskforai/env.conf`, `providers.toml`, and systemd user service
+3. Build from source and install to `${XDG_BIN_HOME:-~/.local/bin}/maskforai`
+4. Create `${XDG_CONFIG_HOME:-~/.config}/maskforai/env.conf`, `providers.toml`, and systemd user service
 5. Enable and start the service
 
 **Post-install:** Edit `~/.config/maskforai/providers.toml` and set each provider `upstream_url`.
@@ -26,7 +26,9 @@ The installer will:
 ## Adaptive proxy detection
 
 On Linux installs that use systemd, `install.sh` now installs a drop-in that generates
-`$XDG_RUNTIME_DIR/maskforai/proxy.env` immediately before `maskforai` starts.
+`$XDG_RUNTIME_DIR/maskforai/proxy.env` immediately before `maskforai` starts. The installer
+also writes the service unit and drop-in with the resolved `${XDG_BIN_HOME:-~/.local/bin}`
+and `${XDG_CONFIG_HOME:-~/.config}` paths, so custom XDG layouts work without manual edits.
 
 Detection order:
 
@@ -54,7 +56,7 @@ When only TUN is present, it clears inherited proxy variables so `reqwest` uses 
 
 ```bash
 # Inspect the generated environment
-~/.local/bin/maskforai-detect-proxy.sh /tmp/maskforai-proxy.env && sed -n '1,120p' /tmp/maskforai-proxy.env
+"${XDG_BIN_HOME:-$HOME/.local/bin}/maskforai-detect-proxy.sh" /tmp/maskforai-proxy.env && sed -n '1,120p' /tmp/maskforai-proxy.env
 
 # Check the mode chosen at service start
 journalctl --user -u maskforai -n 20 --no-pager | rg maskforai-detect-proxy

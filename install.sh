@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # MaskForAI installer for Ubuntu, Debian, Fedora, Rocky Linux
-# Builds from source, installs to ~/.local/bin and sets up systemd user service.
+# Builds from source, installs to XDG_BIN_HOME or ~/.local/bin, and sets up a systemd user service.
 
 set -euo pipefail
 
@@ -71,7 +71,7 @@ mkdir -p "$BIN_DIR"
 echo "==> MaskForAI installer (Ubuntu, Debian, Fedora, Rocky)"
 echo "    Source: $INSTALL_DIR"
 echo "    Binary: $BIN_DIR/maskforai"
-echo "    Adaptive proxy: $([[ \"$NO_ADAPTIVE_PROXY\" == true ]] && echo disabled || echo enabled)"
+echo "    Adaptive proxy: $(if [[ \"$NO_ADAPTIVE_PROXY\" == true ]]; then echo disabled; else echo enabled; fi)"
 echo ""
 
 # Detect distro and install build deps
@@ -208,7 +208,7 @@ install_config() {
         local upstream="https://api.anthropic.com"
         if [[ -f "${HOME}/.config/environment.d/anthropic.conf" ]]; then
             local val
-            val=$(grep -E '^MASKFORAI_UPSTREAM=' "${HOME}/.config/environment.d/anthropic.conf" 2>/dev/null | cut -d= -f2-)
+            val=$(grep -E '^MASKFORAI_UPSTREAM=' "${HOME}/.config/environment.d/anthropic.conf" 2>/dev/null | cut -d= -f2- || true)
             if [[ -n "$val" ]]; then
                 upstream="$val"
             fi
@@ -274,7 +274,7 @@ EOF
 install_systemd() {
     mkdir -p "$SERVICE_DIR"
     local svc="$SERVICE_DIR/maskforai.service"
-    cat > "$svc" << 'EOF'
+    cat > "$svc" << EOF
 [Unit]
 Description=MaskForAI: masks PII/secrets in Claude Code requests before relay
 After=network-online.target
@@ -282,8 +282,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-EnvironmentFile=%h/.config/maskforai/env.conf
-ExecStart=%h/.local/bin/maskforai
+EnvironmentFile=${CONFIG_DIR}/env.conf
+ExecStart=${BIN_DIR}/maskforai
 Restart=on-failure
 RestartSec=5
 
@@ -299,8 +299,20 @@ install_adaptive_proxy() {
     chmod +x "$BIN_DIR/maskforai-detect-proxy.sh"
 
     mkdir -p "${SERVICE_DIR}/maskforai.service.d"
-    cp "${INSTALL_DIR}/systemd/maskforai.service.d/10-adaptive-proxy.conf" \
-        "${SERVICE_DIR}/maskforai.service.d/10-adaptive-proxy.conf"
+    python3 - \
+        "${INSTALL_DIR}/systemd/maskforai.service.d/10-adaptive-proxy.conf" \
+        "${SERVICE_DIR}/maskforai.service.d/10-adaptive-proxy.conf" \
+        "${BIN_DIR}/maskforai-detect-proxy.sh" <<'PY'
+from pathlib import Path
+import sys
+
+src = Path(sys.argv[1])
+dst = Path(sys.argv[2])
+detector_path = sys.argv[3]
+
+content = src.read_text(encoding="utf-8").replace("__MASKFORAI_DETECTOR_PATH__", detector_path)
+dst.write_text(content, encoding="utf-8")
+PY
 
     echo "==> Installed adaptive proxy detector: $BIN_DIR/maskforai-detect-proxy.sh"
     echo "==> Installed systemd drop-in: ${SERVICE_DIR}/maskforai.service.d/10-adaptive-proxy.conf"

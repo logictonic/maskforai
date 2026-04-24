@@ -11,7 +11,7 @@ Local HTTP proxy that masks sensitive data (API keys, passwords, PII) in Claude 
 ./install.sh
 
 # Or with options
-./install.sh --install-dir /path/to/maskforai [--no-start] [--no-systemd]
+./install.sh --install-dir /path/to/maskforai [--no-start] [--no-systemd] [--no-adaptive-proxy] [--auto-strip-proxy-env]
 ```
 
 The installer will:
@@ -22,6 +22,64 @@ The installer will:
 5. Enable and start the service
 
 **Post-install:** Edit `~/.config/maskforai/providers.toml` and set each provider `upstream_url`.
+
+## Adaptive proxy detection
+
+On Linux installs that use systemd, `install.sh` now installs a drop-in that generates
+`$XDG_RUNTIME_DIR/maskforai/proxy.env` immediately before `maskforai` starts.
+
+Detection order:
+
+1. Explicit overrides from `MASKFORAI_PROXY_PROBE_PORTS`
+2. Parsed local core config (`v2rayN`, `sing-box`, `xray`, `v2ray`, `clash`, `mihomo`)
+3. Fallback port probes
+4. TUN interface detection
+5. Direct egress with a warning
+
+When an HTTP proxy is found, the drop-in writes `HTTP_PROXY` / `HTTPS_PROXY`.
+When a SOCKS proxy is found, it writes `ALL_PROXY=socks5h://...`.
+When only TUN is present, it clears inherited proxy variables so `reqwest` uses the system route instead of stale loopback proxy settings.
+
+### Override variables
+
+| Variable | Default | Description |
+|---------|---------|-------------|
+| `MASKFORAI_PROXY_HOST` | `127.0.0.1` | Loopback host used for probe candidates when config omits bind address |
+| `MASKFORAI_PROXY_PROBE_PORTS` | unset | Comma-separated priority list, e.g. `10809:http,10808:socks5,7890:http` |
+| `MASKFORAI_PROXY_HTTP_PORTS` | `10809 7890 2081` | Conservative fallback HTTP probe list for common V2Ray/Clash-style setups |
+| `MASKFORAI_PROXY_SOCKS_PORTS` | `10808 1080 1081 7891 2080` | Fallback SOCKS probe list |
+| `MASKFORAI_TUN_IFACES` | `singbox_tun tun0 utun0 wg0` | Preferred TUN interface names before wildcard fallback |
+
+### Troubleshooting
+
+```bash
+# Inspect the generated environment
+~/.local/bin/maskforai-detect-proxy.sh /tmp/maskforai-proxy.env && sed -n '1,120p' /tmp/maskforai-proxy.env
+
+# Check the mode chosen at service start
+journalctl --user -u maskforai -n 20 --no-pager | rg maskforai-detect-proxy
+
+# Disable adaptive proxy installation if you manage proxy variables manually
+./install.sh --no-adaptive-proxy
+```
+
+```mermaid
+flowchart TD
+    Start[ExecStartPre] --> Parse[Parse local proxy config]
+    Parse --> Candidates[Build HTTP and SOCKS candidates]
+    Override[Env overrides] --> Candidates
+    Candidates --> Probe{"Probe open ports"}
+    Probe -->|"HTTP found"| WriteHttp[Write HTTP_PROXY and HTTPS_PROXY]
+    Probe -->|"SOCKS found"| WriteSocks[Write ALL_PROXY socks5h]
+    Probe -->|"None found"| Tun{"TUN interface present?"}
+    Tun -->|"Yes"| WriteTun[Clear inherited proxy env and use TUN route]
+    Tun -->|"No"| WriteDirect[Clear proxy env and warn]
+    WriteHttp --> Out[proxy.env]
+    WriteSocks --> Out
+    WriteTun --> Out
+    WriteDirect --> Out
+    Out --> Service[maskforai service start]
+```
 
 ## Architecture
 
@@ -97,7 +155,7 @@ cargo build --release
 There is no `install.sh`; use `cargo build --release` and run `target\release\maskforai.exe`.
 
 - **Config directory:** `%USERPROFILE%\.config\maskforai\` for `providers.toml` and `patterns.toml` when `XDG_CONFIG_HOME` is not set (otherwise `XDG_CONFIG_HOME\maskforai\` as on Linux). You can still point to specific files with `MASKFORAI_PROVIDERS_FILE`, `MASKFORAI_PATTERNS_FILE`, and `MASKFORAI_ENV_FILE`.
-- **`env.conf`:** On startup, the process loads optional `KEY=VALUE` lines from `env.conf` in that directory (same idea as the Linux systemd `EnvironmentFile`). Existing environment variables are not overwritten. Use this for `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY` so upstream traffic uses your local HTTP or SOCKS proxy (e.g. V2Ray) without a wrapper script.
+- **`env.conf`:** On startup, the process loads optional `KEY=VALUE` lines from `env.conf` in that directory (same idea as the Linux systemd `EnvironmentFile`). Existing environment variables are not overwritten. Use this for `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY` when you want explicit manual proxy settings on Windows.
 - **Binary path:** add `target\release` to your `PATH` or copy `maskforai.exe` where you prefer.
 
 ## Configure global defaults
@@ -187,9 +245,10 @@ The proxy runs over HTTP by default. For HTTPS:
 
 ```bash
 cargo test
+bash tests/test-detect-proxy.sh
 ```
 
-143 tests (136 unit + 7 integration).
+`cargo test` covers the Rust proxy itself. `bash tests/test-detect-proxy.sh` covers the adaptive proxy detector script.
 
 ## License
 

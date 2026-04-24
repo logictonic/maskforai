@@ -7,6 +7,8 @@ set -euo pipefail
 INSTALL_DIR=""
 NO_START=false
 NO_SYSTEMD=false
+NO_ADAPTIVE_PROXY=false
+AUTO_STRIP_PROXY_ENV=false
 
 # Parse args
 while [[ $# -gt 0 ]]; do
@@ -23,11 +25,21 @@ while [[ $# -gt 0 ]]; do
             NO_SYSTEMD=true
             shift
             ;;
+        --no-adaptive-proxy)
+            NO_ADAPTIVE_PROXY=true
+            shift
+            ;;
+        --auto-strip-proxy-env)
+            AUTO_STRIP_PROXY_ENV=true
+            shift
+            ;;
         -h|--help)
-            echo "Usage: $0 [--install-dir PATH] [--no-start] [--no-systemd]"
+            echo "Usage: $0 [--install-dir PATH] [--no-start] [--no-systemd] [--no-adaptive-proxy] [--auto-strip-proxy-env]"
             echo "  --install-dir   Source directory (default: script dir or ~/.local/share/maskforai)"
             echo "  --no-start      Do not start systemd service after install"
             echo "  --no-systemd    Install binary only, skip systemd setup"
+            echo "  --no-adaptive-proxy  Do not install adaptive proxy detector drop-in"
+            echo "  --auto-strip-proxy-env  Comment out legacy *_PROXY lines in env.conf"
             exit 0
             ;;
         *)
@@ -39,9 +51,11 @@ done
 
 # Paths
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BIN_DIR="${HOME}/.local/bin"
-CONFIG_DIR="${HOME}/.config/maskforai"
-SERVICE_DIR="${HOME}/.config/systemd/user"
+BIN_HOME="${XDG_BIN_HOME:-${HOME}/.local/bin}"
+CONFIG_HOME="${XDG_CONFIG_HOME:-${HOME}/.config}"
+BIN_DIR="${BIN_HOME}"
+CONFIG_DIR="${CONFIG_HOME}/maskforai"
+SERVICE_DIR="${CONFIG_HOME}/systemd/user"
 
 # Detect source dir
 if [[ -z "$INSTALL_DIR" ]]; then
@@ -57,6 +71,7 @@ mkdir -p "$BIN_DIR"
 echo "==> MaskForAI installer (Ubuntu, Debian, Fedora, Rocky)"
 echo "    Source: $INSTALL_DIR"
 echo "    Binary: $BIN_DIR/maskforai"
+echo "    Adaptive proxy: $([[ \"$NO_ADAPTIVE_PROXY\" == true ]] && echo disabled || echo enabled)"
 echo ""
 
 # Detect distro and install build deps
@@ -161,6 +176,30 @@ install_binary() {
     echo "==> Installed to $BIN_DIR/maskforai"
 }
 
+replace_upstream_line() {
+    local file="$1"
+    local upstream="$2"
+    python3 - "$file" "$upstream" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+upstream = sys.argv[2]
+lines = path.read_text(encoding="utf-8").splitlines()
+updated = []
+replaced = False
+for line in lines:
+    if line.startswith("MASKFORAI_UPSTREAM="):
+        updated.append(f"MASKFORAI_UPSTREAM={upstream}")
+        replaced = True
+    else:
+        updated.append(line)
+if not replaced:
+    updated.append(f"MASKFORAI_UPSTREAM={upstream}")
+path.write_text("\n".join(updated) + "\n", encoding="utf-8")
+PY
+}
+
 # Create config templates
 install_config() {
     mkdir -p "$CONFIG_DIR"
@@ -174,35 +213,8 @@ install_config() {
                 upstream="$val"
             fi
         fi
-        cat > "$conf" << EOF
-# MaskForAI global configuration
-# Legacy single-provider fallback upstream (used only when providers.toml is absent)
-MASKFORAI_UPSTREAM=$upstream
-
-# Legacy single-provider fallback port (default: 8432)
-# MASKFORAI_PORT=8432
-
-# Legacy single-provider fallback bind (default: 127.0.0.1)
-# MASKFORAI_BIND=127.0.0.1
-
-# Filter logging: off, summary, detailed (default: off)
-# MASKFORAI_LOG_FILTER=summary
-
-# Minimum confidence score (0.0–1.0, default: 0.0 = mask everything)
-# Higher values reduce false positives but may miss some PII
-# MASKFORAI_MIN_SCORE=0.0
-
-# Allow-list: comma-separated values that should never be masked
-# Built-in: example.com, test@example.com, localhost, 127.0.0.1, etc.
-MASKFORAI_ALLOWLIST=test@example.com,user@example.com,admin@example.com
-
-# Audit log: log SHA256 hashes of masked values (default: off)
-# MASKFORAI_AUDIT_LOG=false
-
-# Whistledown: reversible masking with numbered tokens (default: on)
-# When enabled, PII is replaced with [[TYPE_N]] tokens and restored in responses
-MASKFORAI_WHISTLEDOWN=true
-EOF
+        cp "${INSTALL_DIR}/env.conf" "$conf"
+        replace_upstream_line "$conf" "$upstream"
         echo "==> Created config template: $conf"
         echo "    Edit it to change global defaults if needed"
     else
@@ -281,6 +293,53 @@ EOF
     echo "==> Installed systemd user service: $svc"
 }
 
+install_adaptive_proxy() {
+    mkdir -p "$BIN_DIR"
+    cp "${INSTALL_DIR}/bin/maskforai-detect-proxy.sh" "$BIN_DIR/maskforai-detect-proxy.sh"
+    chmod +x "$BIN_DIR/maskforai-detect-proxy.sh"
+
+    mkdir -p "${SERVICE_DIR}/maskforai.service.d"
+    cp "${INSTALL_DIR}/systemd/maskforai.service.d/10-adaptive-proxy.conf" \
+        "${SERVICE_DIR}/maskforai.service.d/10-adaptive-proxy.conf"
+
+    echo "==> Installed adaptive proxy detector: $BIN_DIR/maskforai-detect-proxy.sh"
+    echo "==> Installed systemd drop-in: ${SERVICE_DIR}/maskforai.service.d/10-adaptive-proxy.conf"
+}
+
+warn_or_strip_proxy_env() {
+    local conf="${CONFIG_DIR}/env.conf"
+
+    [[ -f "$conf" ]] || return 0
+
+    if ! grep -Eq '^(HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|http_proxy|https_proxy|all_proxy)=' "$conf"; then
+        return 0
+    fi
+
+    if [[ "$AUTO_STRIP_PROXY_ENV" == true ]]; then
+        python3 - "$conf" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+path = Path(sys.argv[1])
+pattern = re.compile(r'^(HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|http_proxy|https_proxy|all_proxy)=')
+lines = path.read_text(encoding="utf-8").splitlines()
+updated = []
+for line in lines:
+    if pattern.match(line):
+        updated.append(f"# stripped by install.sh adaptive-proxy migration: {line}")
+    else:
+        updated.append(line)
+path.write_text("\n".join(updated) + "\n", encoding="utf-8")
+PY
+        echo "==> Commented out legacy proxy env lines in $conf"
+    else
+        echo "==> WARNING: $conf still defines *_PROXY variables."
+        echo "    Adaptive proxy detection will override them at runtime."
+        echo "    Re-run with --auto-strip-proxy-env to comment them out automatically."
+    fi
+}
+
 # Enable and start service
 start_service() {
     systemctl --user daemon-reload
@@ -291,6 +350,11 @@ start_service() {
     else
         systemctl --user restart maskforai.service
         echo "==> Restarted maskforai service"
+    fi
+
+    if [[ "$NO_ADAPTIVE_PROXY" != true ]]; then
+        echo "==> Recent adaptive proxy logs"
+        journalctl --user -u maskforai -n 5 --no-pager 2>/dev/null || true
     fi
 }
 
@@ -304,6 +368,12 @@ install_config
 
 if [[ "$NO_SYSTEMD" != true ]]; then
     install_systemd
+    if [[ "$NO_ADAPTIVE_PROXY" != true ]]; then
+        install_adaptive_proxy
+    else
+        echo "==> Skipping adaptive proxy setup (--no-adaptive-proxy)"
+    fi
+    warn_or_strip_proxy_env
     if [[ "$NO_START" != true ]]; then
         start_service
     else
@@ -321,6 +391,9 @@ echo "  1. Edit $CONFIG_DIR/providers.toml and set each provider upstream_url"
 echo "  2. Adjust $CONFIG_DIR/env.conf for global masking defaults if needed"
 echo "  3. For Claude Code, set ANTHROPIC_BASE_URL=http://127.0.0.1:8432"
 echo "  4. For OpenAI-compatible clients, point them to http://127.0.0.1:8434"
+if [[ "$NO_ADAPTIVE_PROXY" != true ]]; then
+    echo "  5. Check journalctl --user -u maskforai -n 20 for maskforai-detect-proxy mode logs"
+fi
 echo ""
 echo "Commands:"
 echo "  systemctl --user status maskforai   # Check status"

@@ -214,6 +214,10 @@ fn finalize_buffered_response_headers(headers: &mut HeaderMap, body_len: usize) 
     );
 }
 
+fn should_buffer_responses(headers: &HeaderMap) -> bool {
+    headers.contains_key(axum::http::header::CONTENT_LENGTH)
+}
+
 /// Proxy handler: intercept, mask, and forward.
 pub async fn proxy_handler(
     State(state): State<ProxyState>,
@@ -533,9 +537,10 @@ pub async fn proxy_handler(
                     }
                 }
             } else {
-                if is_responses {
-                    // `/responses` has proven fragile with direct passthrough on some clients.
-                    // Buffer the full upstream reply and return a clean response instead.
+                if is_responses && should_buffer_responses(&headers) {
+                    // `/responses` with a known finite length can be buffered safely.
+                    // When upstream omits Content-Length, buffering can hang forever waiting
+                    // for a stream that never cleanly terminates.
                     match resp.bytes().await {
                         Ok(body_bytes) => {
                             let mut response =
@@ -579,5 +584,24 @@ pub async fn proxy_handler(
             }
             (StatusCode::BAD_GATEWAY, format!("Upstream error: {}", e)).into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_buffer_responses;
+    use axum::http::{header::CONTENT_LENGTH, HeaderMap, HeaderValue};
+
+    #[test]
+    fn responses_with_content_length_are_buffered() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_LENGTH, HeaderValue::from_static("123"));
+        assert!(should_buffer_responses(&headers));
+    }
+
+    #[test]
+    fn responses_without_content_length_are_streamed() {
+        let headers = HeaderMap::new();
+        assert!(!should_buffer_responses(&headers));
     }
 }

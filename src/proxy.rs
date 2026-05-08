@@ -9,13 +9,17 @@ use crate::patterns::MaskResult;
 use crate::web::WebState;
 use crate::whistledown::{WhistledownMap, WhistledownPatternSet};
 use axum::body::Bytes;
+use axum::extract::FromRequestParts;
+use axum::extract::ws::{Message as AxumWsMsg, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderName, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures::stream::StreamExt;
-use reqwest::Client;
+use futures::SinkExt;
+use reqwest::{Client, NoProxy, Proxy};
 use serde_json::Value;
 use std::sync::Arc;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tracing::info;
 
 /// Shared proxy state.
@@ -27,13 +31,97 @@ pub struct ProxyState {
     pub whistledown_patterns: Arc<WhistledownPatternSet>,
 }
 
+fn first_env(names: &[&'static str]) -> Option<String> {
+    for name in names {
+        if let Ok(v) = std::env::var(name) {
+            let t = v.trim();
+            if !t.is_empty() {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+fn no_proxy_value() -> Option<NoProxy> {
+    first_env(&["NO_PROXY", "no_proxy"])
+        .as_ref()
+        .and_then(|s| NoProxy::from_string(s))
+}
+
+/// Build reqwest with explicit `HTTP(S)_PROXY` / `ALL_PROXY` from the environment.
+/// `reqwest` only applies the default system/env proxy matcher if you never call
+/// [`ClientBuilder::proxy`]; that path is easy to get wrong, so we configure proxies
+/// explicitly when any of the usual env vars is set.
+fn build_reqwest_from_env(config: &Config) -> reqwest::Client {
+    let mut base = Client::builder();
+    if config.http1_only {
+        base = base.http1_only();
+    }
+    let no = no_proxy_value();
+
+    if let Some(url) = first_env(&["ALL_PROXY", "all_proxy"]) {
+        match Proxy::all(&url) {
+            Ok(p) => {
+                if let Ok(c) = base.proxy(p.no_proxy(no.clone())).build() {
+                    return c;
+                }
+                tracing::warn!("Failed to build client with ALL_PROXY; trying HTTP/HTTPS or default");
+            }
+            Err(e) => tracing::warn!(error = %e, "Invalid ALL_PROXY"),
+        }
+    }
+
+    let mut b = {
+        let mut b = Client::builder();
+        if config.http1_only {
+            b = b.http1_only();
+        }
+        b
+    };
+    let mut n = 0;
+    if let Some(url) = first_env(&["HTTP_PROXY", "http_proxy"]) {
+        match Proxy::http(&url) {
+            Ok(p) => {
+                b = b.proxy(p.no_proxy(no.clone()));
+                n += 1;
+            }
+            Err(e) => tracing::warn!(error = %e, "Invalid HTTP_PROXY"),
+        }
+    }
+    if let Some(url) = first_env(&["HTTPS_PROXY", "https_proxy"]) {
+        match Proxy::https(&url) {
+            Ok(p) => {
+                b = b.proxy(p.no_proxy(no));
+                n += 1;
+            }
+            Err(e) => tracing::warn!(error = %e, "Invalid HTTPS_PROXY"),
+        }
+    }
+    if n == 0 {
+        return {
+            let mut b = Client::builder();
+            if config.http1_only {
+                b = b.http1_only();
+            }
+            b.build()
+        }
+        .expect("Failed to create HTTP client");
+    }
+    b.build().expect("Failed to create HTTP client with explicit env proxies")
+}
+
 impl ProxyState {
     pub fn new(config: Config) -> Self {
-        let mut builder = Client::builder();
-        if config.http1_only {
-            builder = builder.http1_only();
+        let has_proxy_env = first_env(&["ALL_PROXY", "all_proxy", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"])
+            .is_some();
+        if has_proxy_env {
+            tracing::info!(
+                provider = %config.provider_name,
+                "Upstream HTTP client: using HTTP_PROXY / HTTPS_PROXY / ALL_PROXY from process environment (URLs not logged)"
+            );
         }
-        let client = builder.build().expect("Failed to create HTTP client");
+        let client = build_reqwest_from_env(&config);
         if config.http1_only {
             tracing::info!(
                 provider = %config.provider_name,
@@ -114,20 +202,192 @@ fn sanitize_streaming_response_headers(headers: &mut HeaderMap) {
     headers.remove(axum::http::header::UPGRADE);
 }
 
-/// Remove hop-by-hop headers and install a correct content length
-/// for fully buffered upstream responses.
-fn finalize_buffered_response_headers(headers: &mut HeaderMap, body_len: usize) {
-    headers.remove(axum::http::header::CONNECTION);
-    headers.remove(axum::http::header::TRANSFER_ENCODING);
-    headers.remove(HeaderName::from_static("keep-alive"));
-    headers.remove(axum::http::header::TE);
-    headers.remove(axum::http::header::TRAILER);
-    headers.remove(axum::http::header::UPGRADE);
-    headers.remove(axum::http::header::CONTENT_LENGTH);
-    headers.insert(
-        axum::http::header::CONTENT_LENGTH,
-        axum::http::HeaderValue::from_str(&body_len.to_string()).unwrap(),
-    );
+/// Compose upstream URL from configured base and the client request URI.
+///
+/// Maps bare `/responses` (used by some Codex transports) to `/v1/responses`.  
+/// If `upstream_url` ends with `/v1` and the path already starts with `/v1/`, strips the
+/// duplicate segment so we never request `/v1/v1/...`.
+fn build_upstream_url(config: &Config, uri: &axum::http::Uri) -> String {
+    let base = config.upstream_url.trim_end_matches('/');
+    let mut path = uri.path().to_string();
+    let query = uri
+        .query()
+        .map(|q| format!("?{}", q))
+        .unwrap_or_default();
+
+    if config.provider_type == ProviderType::Openai && path == "/responses"
+    {
+        path = "/v1/responses".to_string();
+    }
+
+    let path_for_join = if base.ends_with("/v1") && path.starts_with("/v1/") {
+        path.strip_prefix("/v1")
+            .map(|p| format!("/{}", p.trim_start_matches('/')))
+            .unwrap_or(path)
+    } else {
+        path
+    };
+
+    format!("{}{}{}", base, path_for_join, query)
+}
+
+fn https_to_ws_url(https_url: &str) -> Option<String> {
+    if let Some(rest) = https_url.strip_prefix("https://") {
+        Some(format!("wss://{}", rest))
+    } else if let Some(rest) = https_url.strip_prefix("http://") {
+        Some(format!("ws://{}", rest))
+    } else {
+        None
+    }
+}
+
+fn is_openai_responses_path(path: &str) -> bool {
+    path == "/responses"
+        || path.ends_with("/responses")
+        || path == "/v1/responses"
+        || path.ends_with("/v1/responses")
+}
+
+async fn tunnel_openai_responses_ws(
+    state: ProxyState,
+    client: WebSocket,
+    client_uri: axum::http::Uri,
+    client_headers: HeaderMap,
+) {
+    let upstream_https = build_upstream_url(state.config.as_ref(), &client_uri);
+    let Some(upstream_ws) = https_to_ws_url(&upstream_https) else {
+        tracing::error!(%upstream_https, "WebSocket tunnel requires upstream URL starting with http:// or https://");
+        return;
+    };
+
+    let uri: http::Uri = match upstream_ws.parse() {
+        Ok(u) => u,
+        Err(e) => {
+            tracing::error!(error = %e, %upstream_ws, "invalid WebSocket URI");
+            return;
+        }
+    };
+
+    let mut builder =
+        tokio_tungstenite::tungstenite::ClientRequestBuilder::new(uri);
+
+    for name in [
+        axum::http::header::AUTHORIZATION.as_str(),
+        "x-api-key",
+        "openai-organization",
+        "openai-beta",
+        axum::http::header::USER_AGENT.as_str(),
+        axum::http::header::SEC_WEBSOCKET_PROTOCOL.as_str(),
+    ] {
+        if let Some(val) = client_headers.get(name) {
+            if let Ok(s) = val.to_str() {
+                builder = builder.with_header(name, s);
+            }
+        }
+    }
+
+    let ws_req = match builder.into_client_request() {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to build upstream WebSocket request");
+            return;
+        }
+    };
+
+    let (upstream, _resp) = match tokio_tungstenite::connect_async(ws_req).await {
+        Ok(x) => x,
+        Err(e) => {
+            tracing::error!(error = %e, url = %upstream_ws, "upstream WebSocket connect failed");
+            return;
+        }
+    };
+
+    tracing::info!(url = %upstream_ws, "OpenAI Responses WebSocket tunnel established");
+
+    use tokio_tungstenite::tungstenite::Message as TungMsg;
+
+    let (mut up_write, mut up_read) = upstream.split();
+    let (mut cx_write, mut cx_read) = client.split();
+
+    let client_to_upstream = async move {
+        while let Some(msg) = cx_read.next().await {
+            let Ok(msg) = msg else { break };
+            let tung = match msg {
+                AxumWsMsg::Text(t) => TungMsg::Text(t),
+                AxumWsMsg::Binary(b) => TungMsg::Binary(b),
+                AxumWsMsg::Ping(p) => TungMsg::Ping(p),
+                AxumWsMsg::Pong(p) => TungMsg::Pong(p),
+                AxumWsMsg::Close(f) => TungMsg::Close(f.map(|c| {
+                    tokio_tungstenite::tungstenite::protocol::CloseFrame {
+                        code: c.code.into(),
+                        reason: std::borrow::Cow::Owned(c.reason.into_owned()),
+                    }
+                })),
+            };
+            if up_write.send(tung).await.is_err() {
+                break;
+            }
+        }
+        let _ = up_write.close().await;
+    };
+
+    let upstream_to_client = async move {
+        while let Some(msg) = up_read.next().await {
+            let Ok(msg) = msg else { break };
+            let axum_msg = match msg {
+                TungMsg::Text(t) => AxumWsMsg::Text(t),
+                TungMsg::Binary(b) => AxumWsMsg::Binary(b),
+                TungMsg::Ping(p) => AxumWsMsg::Ping(p),
+                TungMsg::Pong(p) => AxumWsMsg::Pong(p),
+                TungMsg::Close(f) => AxumWsMsg::Close(f.map(|c| axum::extract::ws::CloseFrame {
+                    code: c.code.into(),
+                    reason: std::borrow::Cow::Owned(c.reason.into_owned()),
+                })),
+                TungMsg::Frame(_) => continue,
+            };
+            if cx_write.send(axum_msg).await.is_err() {
+                break;
+            }
+        }
+        let _ = cx_write.close().await;
+    };
+
+    tokio::join!(client_to_upstream, upstream_to_client);
+}
+
+/// HTTP entry for every provider listener. When `provider_type` is Openai and the request is a
+/// valid GET WebSocket upgrade on the Responses API paths, tunnels to upstream `wss://`; otherwise
+/// delegates to [`proxy_handler`].
+pub async fn openai_smart_proxy(
+    State(state): State<ProxyState>,
+    req: Request<axum::body::Body>,
+) -> Response {
+    if state.config.provider_type != ProviderType::Openai {
+        return proxy_handler(State(state), req).await;
+    }
+
+    let (mut parts, body) = req.into_parts();
+    let path = parts.uri.path().to_string();
+    if parts.method == axum::http::Method::GET && is_openai_responses_path(&path) {
+        let uri = parts.uri.clone();
+        let client_headers = parts.headers.clone();
+        match WebSocketUpgrade::from_request_parts(&mut parts, &state).await {
+            Ok(ws_up) => {
+                return ws_up
+                    .on_upgrade(move |socket| {
+                        let st = state.clone();
+                        async move {
+                            tunnel_openai_responses_ws(st, socket, uri, client_headers).await
+                        }
+                    })
+                    .into_response();
+            }
+            Err(_) => {}
+        }
+    }
+
+    let req = Request::from_parts(parts, body);
+    proxy_handler(State(state), req).await
 }
 
 /// Proxy handler: intercept, mask, and forward.
@@ -157,7 +417,7 @@ pub async fn proxy_handler(
         web_state.send_log(&format!("[request] {}", request_label));
     }
 
-    let upstream = format!("{}{}", state.config.upstream_url, req.uri());
+    let upstream = build_upstream_url(&state.config, req.uri());
 
     // Forward headers but remove hop-by-hop headers that reqwest should set itself
     let mut forwarded_headers = req.headers().clone();
@@ -417,8 +677,17 @@ pub async fn proxy_handler(
                     sanitize_streaming_response_headers(&mut resp_headers);
                     *response.headers_mut() = resp_headers;
                     response
+                } else if is_responses && !wmap.has_mappings() {
+                    // Streaming JSON/chunked Responses API: buffering the full body stalls Codex (RST).
+                    let body = axum::body::Body::from_stream(resp.bytes_stream());
+                    let mut response = Response::new(body);
+                    *response.status_mut() = status;
+                    let mut resp_headers = headers;
+                    sanitize_streaming_response_headers(&mut resp_headers);
+                    *response.headers_mut() = resp_headers;
+                    response
                 } else {
-                    // Non-SSE whistledown: buffer full response
+                    // Non-SSE whistledown with mappings: must buffer to restore tokens.
                     match resp.bytes().await {
                         Ok(body_bytes) => {
                             let body_str = String::from_utf8_lossy(&body_bytes);
@@ -449,43 +718,14 @@ pub async fn proxy_handler(
                     }
                 }
             } else {
-                if is_responses {
-                    // `/responses` has proven fragile with direct passthrough on some clients.
-                    // Buffer the full upstream reply and return a clean response instead.
-                    match resp.bytes().await {
-                        Ok(body_bytes) => {
-                            let mut response =
-                                Response::new(axum::body::Body::from(body_bytes.clone()));
-                            *response.status_mut() = status;
-                            let mut resp_headers = headers;
-                            finalize_buffered_response_headers(
-                                &mut resp_headers,
-                                body_bytes.len(),
-                            );
-                            *response.headers_mut() = resp_headers;
-                            response
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                error = %e,
-                                "Failed to read upstream response for /responses"
-                            );
-                            (StatusCode::BAD_GATEWAY, format!("Response error: {}", e))
-                                .into_response()
-                        }
-                    }
-                } else {
-                    // Standard streaming passthrough — do not forward upstream framing headers;
-                    // Hyper sets transfer-encoding for the client. Forwarding Connection/TE/CL breaks
-                    // some SSE/HTTP2 clients (e.g. Codex) mid-stream.
-                    let body = axum::body::Body::from_stream(resp.bytes_stream());
-                    let mut response = Response::new(body);
-                    *response.status_mut() = status;
-                    let mut resp_headers = headers;
-                    sanitize_streaming_response_headers(&mut resp_headers);
-                    *response.headers_mut() = resp_headers;
-                    response
-                }
+                // Stream all non-whistledown replies, including `/responses` (Codex expects chunks).
+                let body = axum::body::Body::from_stream(resp.bytes_stream());
+                let mut response = Response::new(body);
+                *response.status_mut() = status;
+                let mut resp_headers = headers;
+                sanitize_streaming_response_headers(&mut resp_headers);
+                *response.headers_mut() = resp_headers;
+                response
             }
         }
         Err(e) => {
@@ -495,5 +735,68 @@ pub async fn proxy_handler(
             }
             (StatusCode::BAD_GATEWAY, format!("Upstream error: {}", e)).into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod build_upstream_url_tests {
+    use super::build_upstream_url;
+    use crate::config::{Config, FilterLogLevel, PatternsConfig, ProviderType};
+
+    fn cfg(upstream: &str, ptype: ProviderType) -> Config {
+        Config {
+            provider_name: "t".into(),
+            provider_type: ptype,
+            port: 1,
+            upstream_url: upstream.into(),
+            bind: "127.0.0.1".into(),
+            filter_log: FilterLogLevel::Off,
+            min_score: 0.0,
+            allowlist: vec![],
+            audit_log: false,
+            custom_patterns: PatternsConfig::default(),
+            whistledown: false,
+            sensitivity: "medium".into(),
+            dry_run: false,
+            web_port: 0,
+            http1_only: false,
+        }
+    }
+
+    #[test]
+    fn openai_no_double_v1_when_base_has_v1() {
+        let c = cfg("https://example/v1", ProviderType::Openai);
+        let u: axum::http::Uri = "/v1/responses".parse().unwrap();
+        assert_eq!(
+            build_upstream_url(&c, &u),
+            "https://example/v1/responses"
+        );
+    }
+
+    #[test]
+    fn openai_bare_responses_becomes_v1() {
+        let c = cfg("https://example", ProviderType::Openai);
+        let u: axum::http::Uri = "/responses".parse().unwrap();
+        assert_eq!(
+            build_upstream_url(&c, &u),
+            "https://example/v1/responses"
+        );
+    }
+
+    #[test]
+    fn openai_bare_responses_with_base_suffix_v1() {
+        let c = cfg("https://example/v1", ProviderType::Openai);
+        let u: axum::http::Uri = "/responses".parse().unwrap();
+        assert_eq!(
+            build_upstream_url(&c, &u),
+            "https://example/v1/responses"
+        );
+    }
+
+    #[test]
+    fn compatible_keeps_bare_responses_path() {
+        let c = cfg("https://example", ProviderType::Compatible);
+        let u: axum::http::Uri = "/responses".parse().unwrap();
+        assert_eq!(build_upstream_url(&c, &u), "https://example/responses");
     }
 }

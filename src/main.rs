@@ -56,8 +56,10 @@ async fn main() {
         } else {
             ProxyState::new(config.clone())
         };
+        // WebSocket tunnel for Codex `/responses` is only active when provider_type is Openai;
+        // other providers go straight to `proxy_handler` inside `openai_smart_proxy`.
         let app = Router::new()
-            .fallback(maskforai::proxy::proxy_handler)
+            .fallback(maskforai::proxy::openai_smart_proxy)
             .with_state(state);
         let addr: SocketAddr = format!("{}:{}", config.bind, config.port)
             .parse()

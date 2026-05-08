@@ -1290,6 +1290,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "futures",
+ "http 1.4.0",
  "httpmock",
  "rand",
  "regex",
@@ -1298,6 +1299,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tokio",
+ "tokio-tungstenite",
  "toml",
  "tower 0.4.13",
  "tower-http 0.5.2",
@@ -2184,7 +2186,9 @@ checksum = "edc5f74e248dc973e0dbb7b74c7e0d6fcc301c694ff50049504004ef4d0cdcd9"
 dependencies = [
  "futures-util",
  "log",
+ "native-tls",
  "tokio",
+ "tokio-native-tls",
  "tungstenite",
 ]
 
@@ -2400,6 +2404,7 @@ dependencies = [
  "http 1.4.0",
  "httparse",
  "log",
+ "native-tls",
  "rand",
  "sha1",
  "thiserror",

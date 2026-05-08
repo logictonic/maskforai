@@ -171,7 +171,13 @@ impl SseRehydrator {
             return String::new();
         }
 
-        let emit_end = restored.len() - self.overlap_size;
+        let raw_emit_end = restored.len() - self.overlap_size;
+        // `str` slice endpoints must be UTF-8 char boundaries; overlap is in bytes and can
+        // land inside a multibyte codepoint (e.g. Cyrillic in model output).
+        let mut emit_end = restored.floor_char_boundary(raw_emit_end);
+        if emit_end == 0 && raw_emit_end > 0 {
+            emit_end = restored.ceil_char_boundary(raw_emit_end);
+        }
         // Find a safe split point (don't split in the middle of a line)
         let split_at = restored[..emit_end]
             .rfind('\n')
